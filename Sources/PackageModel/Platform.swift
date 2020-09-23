@@ -29,12 +29,12 @@ public final class PlatformRegistry {
 
     /// The static list of known platforms.
     private static var _knownPlatforms: [Platform] {
-        return [.macOS, .iOS, .tvOS, .watchOS, .linux, .android]
+        return [.macOS, .iOS, .tvOS, .watchOS, .linux, .windows, .android, .wasi]
     }
 }
 
 /// Represents a platform.
-public struct Platform: Equatable, Hashable {
+public struct Platform: Equatable, Hashable, Codable {
     /// The name of the platform.
     public let name: String
 
@@ -51,15 +51,18 @@ public struct Platform: Equatable, Hashable {
     }
     
     public static let macOS: Platform = Platform(name: "macos", oldestSupportedVersion: "10.10")
-    public static let iOS: Platform = Platform(name: "ios", oldestSupportedVersion: "8.0")
+    public static let iOS: Platform = Platform(name: "ios", oldestSupportedVersion: "9.0")
     public static let tvOS: Platform = Platform(name: "tvos", oldestSupportedVersion: "9.0")
     public static let watchOS: Platform = Platform(name: "watchos", oldestSupportedVersion: "2.0")
     public static let linux: Platform = Platform(name: "linux", oldestSupportedVersion: .unknown)
     public static let android: Platform = Platform(name: "android", oldestSupportedVersion: .unknown)
+    public static let windows: Platform = Platform(name: "windows", oldestSupportedVersion: .unknown)
+    public static let wasi: Platform = Platform(name: "wasi", oldestSupportedVersion: .unknown)
+
 }
 
 /// Represents a platform version.
-public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable {
+public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable, Codable {
 
     /// The unknown platform version.
     public static let unknown: PlatformVersion = .init("0.0.0")
@@ -75,6 +78,10 @@ public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable 
         }
         return str
     }
+
+    public var major: Int { version.major }
+    public var minor: Int { version.minor }
+    public var patch: Int { version.patch }
 
     /// Create a platform version given a string.
     ///
@@ -108,15 +115,19 @@ public struct PlatformVersion: ExpressibleByStringLiteral, Comparable, Hashable 
 }
 
 /// Represents a platform supported by a target.
-public struct SupportedPlatform {
+public struct SupportedPlatform: Codable {
     /// The platform.
     public let platform: Platform
 
     /// The minimum required version for this platform.
     public let version: PlatformVersion
 
-    public init(platform: Platform, version: PlatformVersion) {
+    /// The options declared by the platform.
+    public let options: [String]
+
+    public init(platform: Platform, version: PlatformVersion, options: [String] = []) {
         self.platform = platform
         self.version = version
+        self.options = options
     }
 }

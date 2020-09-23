@@ -11,6 +11,7 @@
 import TSCBasic
 import TSCUtility
 
+import SPMBuildCore
 import Build
 import PackageGraph
 import PackageModel
@@ -111,7 +112,7 @@ struct APIDigesterBaselineDumper {
             buildParameters: buildParameters,
             useBuildManifestCaching: false,
             packageGraphLoader: { graph },
-            diags: diags,
+            diagnostics: diags,
             stdoutStream: stdoutStream
         )
 

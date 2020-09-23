@@ -15,28 +15,15 @@ import PackageGraph
 import PackageModel
 import LLBuildManifest
 import SPMLLBuild
+import SPMBuildCore
 
-/// An enum representing what subset of the package to build.
-public enum BuildSubset {
-    /// Represents the subset of all products and non-test targets.
-    case allExcludingTests
+public final class BuildOperation: PackageStructureDelegate, SPMBuildCore.BuildSystem {
 
-    /// Represents the subset of all products and targets.
-    case allIncludingTests
-
-    /// Represents a specific product.
-    case product(String)
-
-    /// Represents a specific target.
-    case target(String)
-}
-
-public final class BuildOperation: PackageStructureDelegate {
     /// The build parameters.
     public let buildParameters: BuildParameters
 
     /// The diagnostics engine.
-    public let diags: DiagnosticsEngine
+    public let diagnostics: DiagnosticsEngine
 
     /// The closure for loading the package graph.
     let packageGraphLoader: () throws -> PackageGraph
@@ -45,7 +32,7 @@ public final class BuildOperation: PackageStructureDelegate {
     private var buildDelegate: BuildDelegate?
 
     /// The build system reference.
-    private var buildSystem: BuildSystem?
+    private var buildSystem: SPMLLBuild.BuildSystem?
 
     /// If build manifest caching should be enabled.
     public let useBuildManifestCaching: Bool
@@ -53,69 +40,64 @@ public final class BuildOperation: PackageStructureDelegate {
     /// The build plan that was computed, if any.
     public private(set) var buildPlan: BuildPlan?
 
+    /// The build description resulting from planing.
+    private var buildDescription: BuildDescription?
+
+    /// The loaded package graph.
+    private var packageGraph: PackageGraph?
+
     /// The stdout stream for the build delegate.
     let stdoutStream: OutputByteStream
+
+    public var builtTestProducts: [BuiltTestProduct] {
+        (try? getBuildDescription())?.builtTestProducts ?? []
+    }
 
     public init(
         buildParameters: BuildParameters,
         useBuildManifestCaching: Bool,
         packageGraphLoader: @escaping () throws -> PackageGraph,
-        diags: DiagnosticsEngine,
+        diagnostics: DiagnosticsEngine,
         stdoutStream: OutputByteStream
     ) {
         self.buildParameters = buildParameters
         self.useBuildManifestCaching = useBuildManifestCaching
         self.packageGraphLoader = packageGraphLoader
-        self.diags = diags
+        self.diagnostics = diagnostics
         self.stdoutStream = stdoutStream
     }
 
-    /// Returns the package graph using the graph loader closure.
-    ///
-    /// First access will cache the graph.
     public func getPackageGraph() throws -> PackageGraph {
-        if let packageGraph = _packageGraph {
-            return packageGraph
+        try memoize(to: &packageGraph) {
+            try self.packageGraphLoader()
         }
-        _packageGraph = try packageGraphLoader()
-        return _packageGraph!
     }
-    private var _packageGraph: PackageGraph?
 
     /// Compute and return the latest build descroption.
     ///
     /// This will try skip build planning if build manifest caching is enabled
     /// and the package structure hasn't changed.
     public func getBuildDescription() throws -> BuildDescription {
-        if useBuildManifestCaching {
-            try buildPackageStructure()
+        try memoize(to: &buildDescription) {
+            if useBuildManifestCaching {
+                try buildPackageStructure()
 
-            // Return the build description that's on disk. We trust the above build to
-            // update the build description when needed.
-            do {
-                return try BuildDescription.load(from: buildParameters.buildDescriptionPath)
-            }
-            catch {
-                // Silently regnerate the build description if we failed to decode (which could happen
-                // because the existing file was created by different version of swiftpm).
-                if !(error is DecodingError) {
-                    diags.emit(
-                        warning:
-                            "failed to load the build description; running build planning\n    \(error)"
-                    )
+                // Return the build description that's on disk. We trust the above build to
+                // update the build description when needed.
+                do {
+                    return try BuildDescription.load(from: buildParameters.buildDescriptionPath)
+                } catch {
+                    // Silently regnerate the build description if we failed to decode (which could happen
+                    // because the existing file was created by different version of swiftpm).
+                    if !(error is DecodingError) {
+                        diagnostics.emit(warning: "failed to load the build description; running build planning: \(error)")
+                    }
                 }
             }
+
+            // We need to perform actual planning if we reach here.
+            return try plan()
         }
-
-        // We need to perform actual planning if we reach here.
-        return try plan()
-    }
-
-    /// Perform a build using the given subset.
-    ///
-    /// This will automatically compute the build description.
-    public func build(subset: BuildSubset = .allExcludingTests) throws {
-        try build(buildDescription: getBuildDescription(), subset: subset)
     }
 
     /// Cancel the active build operation.
@@ -124,9 +106,9 @@ public final class BuildOperation: PackageStructureDelegate {
     }
 
     /// Perform a build using the given build description and subset.
-    public func build(buildDescription: BuildDescription, subset: BuildSubset) throws {
+    public func build(subset: BuildSubset) throws {
         // Create the build system.
-        let buildSystem = try createBuildSystem(with: buildDescription)
+        let buildSystem = try createBuildSystem(with: getBuildDescription())
         self.buildSystem = buildSystem
 
         // Perform the build.
@@ -158,7 +140,7 @@ public final class BuildOperation: PackageStructureDelegate {
             let graph = try getPackageGraph()
             if let result = subset.llbuildTargetName(
                 for: graph,
-                diagnostics: diags,
+                diagnostics: diagnostics,
                 config: buildParameters.configuration.dirname
             ) {
                 return result
@@ -173,7 +155,7 @@ public final class BuildOperation: PackageStructureDelegate {
         let plan = try BuildPlan(
             buildParameters: buildParameters,
             graph: graph,
-            diagnostics: diags
+            diagnostics: diagnostics
         )
         self.buildPlan = plan
 
@@ -197,7 +179,7 @@ public final class BuildOperation: PackageStructureDelegate {
     /// building the package structure target.
     private func createBuildSystem(
         with buildDescription: BuildDescription?
-    ) throws -> BuildSystem {
+    ) throws -> SPMLLBuild.BuildSystem {
         // Figure out which progress bar we have to use during the build.
         let isVerbose = verbosity != .concise
         let progressAnimation: ProgressAnimationProtocol = isVerbose
@@ -213,7 +195,7 @@ public final class BuildOperation: PackageStructureDelegate {
         // Create the build delegate.
         let buildDelegate = BuildDelegate(
             bctx: bctx,
-            diagnostics: diags,
+            diagnostics: diagnostics,
             outputStream: self.stdoutStream,
             progressAnimation: progressAnimation
         )
@@ -224,7 +206,8 @@ public final class BuildOperation: PackageStructureDelegate {
         let buildSystem = BuildSystem(
             buildFile: buildParameters.llbuildManifest.pathString,
             databaseFile: databasePath,
-            delegate: buildDelegate
+            delegate: buildDelegate,
+            schedulerLanes: buildParameters.jobs
         )
         buildDelegate.onCommmandFailure = { buildSystem.cancel() }
 
@@ -239,7 +222,7 @@ public final class BuildOperation: PackageStructureDelegate {
             return false
         }
         catch {
-            diags.emit(error)
+            diagnostics.emit(error)
             return false
         }
         return true
@@ -252,12 +235,16 @@ extension BuildDescription {
         let llbuild = LLBuildManifestBuilder(plan)
         try llbuild.generateManifest(at: plan.buildParameters.llbuildManifest)
 
+        let swiftCommands = llbuild.manifest.getCmdToolMap(kind: SwiftCompilerTool.self)
+        let swiftFrontendCommands = llbuild.manifest.getCmdToolMap(kind: SwiftFrontendTool.self)
         let testDiscoveryCommands = llbuild.manifest.getCmdToolMap(kind: TestDiscoveryTool.self)
         let copyCommands = llbuild.manifest.getCmdToolMap(kind: CopyTool.self)
 
         // Create the build description.
         let buildDescription = BuildDescription(
             plan: plan,
+            swiftCommands: swiftCommands,
+            swiftFrontendCommands: swiftFrontendCommands,
             testDiscoveryCommands: testDiscoveryCommands,
             copyCommands: copyCommands
         )

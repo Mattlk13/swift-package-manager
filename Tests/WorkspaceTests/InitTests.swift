@@ -88,7 +88,8 @@ class InitTests: XCTestCase {
             
             // Try building it
             XCTAssertBuilds(path)
-            let binPath = path.appending(components: ".build", Destination.host.target.tripleString, "debug")
+            let triple = Resources.default.toolchain.triple
+            let binPath = path.appending(components: ".build", triple.tripleString, "debug")
             XCTAssertFileExists(binPath.appending(component: "Foo"))
             XCTAssertFileExists(binPath.appending(component: "Foo.swiftmodule"))
         }
@@ -131,7 +132,8 @@ class InitTests: XCTestCase {
 
             // Try building it
             XCTAssertBuilds(path)
-            XCTAssertFileExists(path.appending(components: ".build", Destination.host.target.tripleString, "debug", "Foo.swiftmodule"))
+            let triple = Resources.default.toolchain.triple
+            XCTAssertFileExists(path.appending(components: ".build", triple.tripleString, "debug", "Foo.swiftmodule"))
         }
     }
     
@@ -212,7 +214,8 @@ class InitTests: XCTestCase {
 
             // Try building it.
             XCTAssertBuilds(packageRoot)
-            XCTAssertFileExists(packageRoot.appending(components: ".build", Destination.host.target.tripleString, "debug", "some_package.swiftmodule"))
+            let triple = Resources.default.toolchain.triple
+            XCTAssertFileExists(packageRoot.appending(components: ".build", triple.tripleString, "debug", "some_package.swiftmodule"))
         }
     }
     
@@ -233,6 +236,68 @@ class InitTests: XCTestCase {
             #else
               XCTAssertBuilds(packageRoot)
             #endif
+        }
+    }
+
+    func testXCTestManifestOption() throws {
+        try withTemporaryDirectory(removeTreeOnDeinit: true) { tempDirPath in
+            var options = InitPackage.InitPackageOptions(packageType: .library)
+
+            func assertTestManifestFiles(options: InitPackage.InitPackageOptions, expected: Bool) throws {
+                let packageRoot = tempDirPath.appending(component: "Foo")
+                try localFileSystem.removeFileTree(packageRoot)
+                try localFileSystem.createDirectory(packageRoot)
+
+                let initPackage = try InitPackage(
+                    name: "Foo",
+                    destinationPath: packageRoot,
+                    options: options
+                )
+                var progressMessages = [String]()
+                initPackage.progressReporter = { message in
+                    progressMessages.append(message)
+                }
+                try initPackage.writePackageStructure()
+
+                let linuxMain = packageRoot.appending(RelativePath("Tests/LinuxMain.swift"))
+                let xctManifest = packageRoot.appending(RelativePath("Tests/FooTests/XCTestManifests.swift"))
+
+                XCTAssertEqual(localFileSystem.isFile(linuxMain), expected, "\(progressMessages)")
+                XCTAssertEqual(localFileSystem.isFile(xctManifest), expected, "\(progressMessages)")
+            }
+
+            options.enableXCTestManifest = true
+            try assertTestManifestFiles(options: options, expected: true)
+
+            options.enableXCTestManifest = false
+            try assertTestManifestFiles(options: options, expected: false)
+        }
+    }
+
+    func testPlatforms() throws {
+        try withTemporaryDirectory(removeTreeOnDeinit: true) { tempDirPath in
+            var options = InitPackage.InitPackageOptions(packageType: .library)
+            options.platforms = [
+                .init(platform: .macOS, version: PlatformVersion("10.15")),
+                .init(platform: .iOS, version: PlatformVersion("12")),
+                .init(platform: .watchOS, version: PlatformVersion("2.1")),
+                .init(platform: .tvOS, version: PlatformVersion("999")),
+            ]
+
+            let packageRoot = tempDirPath.appending(component: "Foo")
+            try localFileSystem.removeFileTree(packageRoot)
+            try localFileSystem.createDirectory(packageRoot)
+
+            let initPackage = try InitPackage(
+                name: "Foo",
+                destinationPath: packageRoot,
+                options: options
+            )
+            try initPackage.writePackageStructure()
+
+            let contents = try localFileSystem.readFileContents(packageRoot.appending(component: "Package.swift")).cString
+            let expectedString = #"platforms: [.macOS(.v10_15), .iOS(.v12), .watchOS("2.1"), .tvOS("999.0")],"#
+            XCTAssert(contents.contains(expectedString), contents)
         }
     }
 

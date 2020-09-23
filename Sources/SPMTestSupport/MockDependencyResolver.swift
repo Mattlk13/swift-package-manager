@@ -11,23 +11,23 @@ import XCTest
 import Dispatch
 
 import TSCBasic
+import PackageModel
 import PackageGraph
 import SourceControl
 
 import struct TSCUtility.Version
 
-public typealias MockDependencyResolver = DependencyResolver
 public typealias MockPackageConstraint = PackageContainerConstraint
 
 extension MockPackageConstraint {
-    public init(container identifier: String, requirement: PackageRequirement) {
+    public init(container identifier: String, requirement: PackageRequirement, products: ProductFilter) {
         let ref = PackageReference(identity: identifier.lowercased(), path: "")
-        self.init(container: ref, requirement: requirement)
+        self.init(container: ref, requirement: requirement, products: products)
     }
 
-    public init(container identifier: String, versionRequirement: VersionSetSpecifier) {
+    public init(container identifier: String, versionRequirement: VersionSetSpecifier, products: ProductFilter) {
         let ref = PackageReference(identity: identifier.lowercased(), path: "")
-        self.init(container: ref, versionRequirement: versionRequirement)
+        self.init(container: ref, versionRequirement: versionRequirement, products: products)
     }
 }
 
@@ -63,15 +63,16 @@ extension PackageContainerConstraint {
         guard case let .dictionary(dict) = json else { fatalError() }
         guard case let .string(identifier)? = dict["identifier"] else { fatalError() }
         guard let requirement = dict["requirement"] else { fatalError() }
-        let id = PackageReference(identity: identifier.lowercased(), path: "")
-        self.init(container: id, versionRequirement: VersionSetSpecifier(requirement))
+        let products: ProductFilter = try! JSON(dict).get("products")
+        let id = PackageReference(identity: identifier.lowercased(), path: "", kind: .remote)
+        self.init(container: id, versionRequirement: VersionSetSpecifier(requirement), products: products)
     }
 }
 
 extension PackageContainerProvider {
     public func getContainer(
         for identifier: PackageReference,
-        completion: @escaping (Result<PackageContainer, AnyError>) -> Void
+        completion: @escaping (Result<PackageContainer, Error>) -> Void
     ) {
         getContainer(for: identifier, skipUpdate: false, completion: completion)
     }
@@ -109,19 +110,19 @@ public class MockPackageContainer: PackageContainer {
         return _versions
     }
 
-    public func getDependencies(at version: Version) -> [MockPackageConstraint] {
+    public func getDependencies(at version: Version, productFilter: ProductFilter) -> [MockPackageConstraint] {
         requestedVersions.insert(version)
-        return getDependencies(at: version.description)
+        return getDependencies(at: version.description, productFilter: productFilter)
     }
 
-    public func getDependencies(at revision: String) -> [MockPackageConstraint] {
+    public func getDependencies(at revision: String, productFilter: ProductFilter) -> [MockPackageConstraint] {
         return dependencies[revision]!.map({ value in
             let (name, requirement) = value
-            return MockPackageConstraint(container: name, requirement: requirement)
+            return MockPackageConstraint(container: name, requirement: requirement, products: productFilter)
         })
     }
 
-    public func getUnversionedDependencies() -> [MockPackageConstraint] {
+    public func getUnversionedDependencies(productFilter: ProductFilter) -> [MockPackageConstraint] {
         return unversionedDeps
     }
 
@@ -140,11 +141,11 @@ public class MockPackageContainer: PackageContainer {
         var dependencies: [String: [Dependency]] = [:]
         for (version, deps) in dependenciesByVersion {
             dependencies[version.description] = deps.map({
-                let ref = PackageReference(identity: $0.container.lowercased(), path: "")
+                let ref = PackageReference(identity: $0.container.lowercased(), path: "/\($0.container)")
                 return (ref, .versionSet($0.versionRequirement))
             })
         }
-        let ref = PackageReference(identity: name.lowercased(), path: "")
+        let ref = PackageReference(identity: name.lowercased(), path: "/\(name)")
         self.init(name: ref, dependencies: dependencies)
     }
 
@@ -209,11 +210,11 @@ public struct MockPackagesProvider: PackageContainerProvider {
     public func getContainer(
         for identifier: PackageReference,
         skipUpdate: Bool,
-        completion: @escaping (Result<PackageContainer, AnyError>
+        completion: @escaping (Result<PackageContainer, Error>
     ) -> Void) {
         DispatchQueue.global().async {
             completion(self.containersByIdentifier[identifier].map{ .success($0) } ??
-                Result(MockLoadingError.unknownModule))
+                .failure(MockLoadingError.unknownModule))
         }
     }
 }
@@ -231,13 +232,7 @@ extension DependencyResolver {
         file: StaticString = #file,
         line: UInt = #line
     ) throws -> [(container: String, version: Version)] {
-        return try resolve(constraints: constraints).compactMap({
-            guard case .version(let version) = $0.binding else {
-                XCTFail("Unexpected non version binding \($0.binding)", file: file, line: line)
-                return nil
-            }
-            return ($0.container.identity, version)
-        })
+        fatalError()
     }
 }
 

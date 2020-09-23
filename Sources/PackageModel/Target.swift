@@ -9,14 +9,87 @@
 */
 
 import TSCBasic
+import TSCUtility
 
-public class Target: ObjectIdentifierProtocol {
+public class Target: ObjectIdentifierProtocol, PolymorphicCodableProtocol {
+    public static var implementations: [PolymorphicCodableProtocol.Type] = [
+        SwiftTarget.self,
+        ClangTarget.self,
+        SystemLibraryTarget.self,
+        BinaryTarget.self,
+    ]
+
     /// The target kind.
-    public enum Kind: String {
+    public enum Kind: String, Codable {
         case executable
         case library
         case systemModule = "system-target"
         case test
+        case binary
+    }
+
+    /// A reference to a product from a target dependency.
+    public struct ProductReference: Codable {
+
+        /// The name of the product dependency.
+        public let name: String
+
+        /// The name of the package containing the product.
+        public let package: String?
+
+        /// Creates a product reference instance.
+        public init(name: String, package: String?) {
+            self.name = name
+            self.package = package
+        }
+    }
+
+    /// A target dependency to a target or product.
+    public enum Dependency {
+
+        /// A dependency referencing another target, with conditions.
+        case target(_ target: Target, conditions: [PackageConditionProtocol])
+
+        /// A dependency referencing a product, with conditions.
+        case product(_ product: ProductReference, conditions: [PackageConditionProtocol])
+
+        /// The target if the dependency is a target dependency.
+        public var target: Target? {
+            if case .target(let target, _) = self {
+                return target
+            } else {
+                return nil
+            }
+        }
+
+        /// The product reference if the dependency is a product dependency.
+        public var product: ProductReference? {
+            if case .product(let product, _) = self {
+                return product
+            } else {
+                return nil
+            }
+        }
+
+        /// The dependency conditions.
+        public var conditions: [PackageConditionProtocol] {
+            switch self {
+            case .target(_, let conditions):
+                return conditions
+            case .product(_, let conditions):
+                return conditions
+            }
+        }
+
+        /// The name of the target or product of the dependency.
+        public var name: String {
+            switch self {
+            case .target(let target, _):
+                return target.name
+            case .product(let product, _):
+                return product.name
+            }
+        }
     }
 
     /// The name of the target.
@@ -25,11 +98,11 @@ public class Target: ObjectIdentifierProtocol {
     /// name) name in many cases, instead use c99name if you need uniqueness.
     public let name: String
 
-    /// The dependencies of this target.
-    public let dependencies: [Target]
+    /// The default localization for resources.
+    public let defaultLocalization: String?
 
-    /// The product dependencies of this target.
-    public let productDependencies: [(name: String, package: String?)]
+    /// The dependencies of this target.
+    public let dependencies: [Dependency]
 
     /// The language-level target name.
     public let c99name: String
@@ -63,24 +136,59 @@ public class Target: ObjectIdentifierProtocol {
     fileprivate init(
         name: String,
         bundleName: String? = nil,
+        defaultLocalization: String?,
         platforms: [SupportedPlatform],
         type: Kind,
         sources: Sources,
         resources: [Resource] = [],
-        dependencies: [Target],
-        productDependencies: [(name: String, package: String?)] = [],
+        dependencies: [Target.Dependency],
         buildSettings: BuildSettings.AssignmentTable
     ) {
         self.name = name
         self.bundleName = bundleName
+        self.defaultLocalization = defaultLocalization
         self.platforms = platforms
         self.type = type
         self.sources = sources
         self.resources = resources
         self.dependencies = dependencies
-        self.productDependencies = productDependencies
         self.c99name = self.name.spm_mangledToC99ExtendedIdentifier()
         self.buildSettings = buildSettings
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, bundleName, defaultLocalization, platforms, type, sources, resources, buildSettings
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        // FIXME: dependencies property is skipped on purpose as it points to
+        // the actual target dependency object.
+        try container.encode(name, forKey: .name)
+        try container.encode(bundleName, forKey: .bundleName)
+        try container.encode(defaultLocalization, forKey: .defaultLocalization)
+        try container.encode(platforms, forKey: .platforms)
+        try container.encode(type, forKey: .type)
+        try container.encode(sources, forKey: .sources)
+        try container.encode(resources, forKey: .resources)
+        try container.encode(buildSettings, forKey: .buildSettings)
+    }
+
+    required public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.bundleName = try container.decodeIfPresent(String.self, forKey: .bundleName)
+        self.defaultLocalization = try container.decodeIfPresent(String.self, forKey: .defaultLocalization)
+        self.platforms = try container.decode([SupportedPlatform].self, forKey: .platforms)
+        self.type = try container.decode(Kind.self, forKey: .type)
+        self.sources = try container.decode(Sources.self, forKey: .sources)
+        self.resources = try container.decode([Resource].self, forKey: .resources)
+        // FIXME: dependencies property is skipped on purpose as it points to
+        // the actual target dependency object.
+        self.dependencies = []
+        self.c99name = self.name.spm_mangledToC99ExtendedIdentifier()
+        self.buildSettings = try container.decode(BuildSettings.AssignmentTable.self, forKey: .buildSettings)
     }
 }
 
@@ -89,11 +197,12 @@ public class SwiftTarget: Target {
     /// The file name of linux main file.
     public static let linuxMainBasename = "LinuxMain.swift"
 
-    public init(testDiscoverySrc: Sources, name: String, dependencies: [Target]) {
+    public init(testDiscoverySrc: Sources, name: String, dependencies: [Target.Dependency]) {
         self.swiftVersion = .v5
 
         super.init(
             name: name,
+            defaultLocalization: nil,
             platforms: [],
             type: .executable,
             sources: testDiscoverySrc,
@@ -103,14 +212,14 @@ public class SwiftTarget: Target {
     }
 
     /// Create an executable Swift target from linux main test manifest file.
-    init(linuxMain: AbsolutePath, name: String, dependencies: [Target]) {
+    init(linuxMain: AbsolutePath, name: String, dependencies: [Target.Dependency]) {
         // Look for the first swift test target and use the same swift version
         // for linux main target. This will need to change if we move to a model
         // where we allow per target swift language version build settings.
-        let swiftTestTarget = dependencies.first(where: {
-            guard case let target as SwiftTarget = $0 else { return false }
+        let swiftTestTarget = dependencies.first {
+            guard case .target(let target as SwiftTarget, _) = $0 else { return false }
             return target.type == .test
-        }).flatMap({ $0 as? SwiftTarget })
+        }.flatMap { $0.target as? SwiftTarget }
 
         // FIXME: This is not very correct but doesn't matter much in practice.
         // We need to select the latest Swift language version that can
@@ -123,12 +232,12 @@ public class SwiftTarget: Target {
 
         super.init(
             name: name,
+            defaultLocalization: nil,
             platforms: platforms,
             type: .executable,
             sources: sources,
             dependencies: dependencies,
             buildSettings: .init()
-
         )
     }
 
@@ -138,12 +247,12 @@ public class SwiftTarget: Target {
     public init(
         name: String,
         bundleName: String? = nil,
+        defaultLocalization: String? = nil,
         platforms: [SupportedPlatform] = [],
         isTest: Bool = false,
         sources: Sources,
         resources: [Resource] = [],
-        dependencies: [Target] = [],
-        productDependencies: [(name: String, package: String?)] = [],
+        dependencies: [Target.Dependency] = [],
         swiftVersion: SwiftLanguageVersion,
         buildSettings: BuildSettings.AssignmentTable = .init()
     ) {
@@ -152,14 +261,30 @@ public class SwiftTarget: Target {
         super.init(
             name: name,
             bundleName: bundleName,
+            defaultLocalization: defaultLocalization,
             platforms: platforms,
             type: type,
             sources: sources,
             resources: resources,
             dependencies: dependencies,
-            productDependencies: productDependencies,
             buildSettings: buildSettings
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case swiftVersion
+    }
+
+    public override func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(swiftVersion, forKey: .swiftVersion)
+        try super.encode(to: encoder)
+    }
+
+    required public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.swiftVersion = try container.decode(SwiftLanguageVersion.self, forKey: .swiftVersion)
+        try super.init(from: decoder)
     }
 }
 
@@ -194,12 +319,33 @@ public class SystemLibraryTarget: Target {
         self.isImplicit = isImplicit
         super.init(
             name: name,
+            defaultLocalization: nil,
             platforms: platforms,
             type: .systemModule,
             sources: sources,
             dependencies: [],
             buildSettings: .init()
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case pkgConfig, providers, isImplicit
+    }
+
+    public override func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(pkgConfig, forKey: .pkgConfig)
+        try container.encode(providers, forKey: .providers)
+        try container.encode(isImplicit, forKey: .isImplicit)
+        try super.encode(to: encoder)
+    }
+
+    required public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.pkgConfig = try container.decodeIfPresent(String.self, forKey: .pkgConfig)
+        self.providers = try container.decodeIfPresent([SystemPackageProviderDescription].self, forKey: .providers)
+        self.isImplicit = try container.decode(Bool.self, forKey: .isImplicit)
+        try super.init(from: decoder)
     }
 }
 
@@ -210,6 +356,14 @@ public class ClangTarget: Target {
 
     /// The path to include directory.
     public let includeDir: AbsolutePath
+    
+    /// The target's module map type, which determines whether this target vends a custom module map, a generated module map, or no module map at all.
+    public let moduleMapType: ModuleMapType
+
+    /// The headers present in the target.
+    ///
+    /// Note that this contains both public and non-public headers.
+    public let headers: [AbsolutePath]
 
     /// True if this is a C++ target.
     public let isCXX: Bool
@@ -223,15 +377,17 @@ public class ClangTarget: Target {
     public init(
         name: String,
         bundleName: String? = nil,
+        defaultLocalization: String? = nil,
         platforms: [SupportedPlatform] = [],
         cLanguageStandard: String?,
         cxxLanguageStandard: String?,
         includeDir: AbsolutePath,
+        moduleMapType: ModuleMapType,
+        headers: [AbsolutePath] = [],
         isTest: Bool = false,
         sources: Sources,
         resources: [Resource] = [],
-        dependencies: [Target] = [],
-        productDependencies: [(name: String, package: String?)] = [],
+        dependencies: [Target.Dependency] = [],
         buildSettings: BuildSettings.AssignmentTable = .init()
     ) {
         assert(includeDir.contains(sources.root), "\(includeDir) should be contained in the source root \(sources.root)")
@@ -240,17 +396,146 @@ public class ClangTarget: Target {
         self.cLanguageStandard = cLanguageStandard
         self.cxxLanguageStandard = cxxLanguageStandard
         self.includeDir = includeDir
+        self.moduleMapType = moduleMapType
+        self.headers = headers
         super.init(
             name: name,
             bundleName: bundleName,
+            defaultLocalization: defaultLocalization,
             platforms: platforms,
             type: type,
             sources: sources,
             resources: resources,
             dependencies: dependencies,
-            productDependencies: productDependencies,
             buildSettings: buildSettings
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case includeDir, moduleMapType, headers, isCXX, cLanguageStandard, cxxLanguageStandard
+    }
+
+    public override func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(includeDir, forKey: .includeDir)
+        try container.encode(moduleMapType, forKey: .moduleMapType)
+        try container.encode(headers, forKey: .headers)
+        try container.encode(isCXX, forKey: .isCXX)
+        try container.encode(cLanguageStandard, forKey: .cLanguageStandard)
+        try container.encode(cxxLanguageStandard, forKey: .cxxLanguageStandard)
+        try super.encode(to: encoder)
+    }
+
+    required public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.includeDir = try container.decode(AbsolutePath.self, forKey: .includeDir)
+        self.moduleMapType = try container.decode(ModuleMapType.self, forKey: .moduleMapType)
+        self.headers = try container.decode([AbsolutePath].self, forKey: .headers)
+        self.isCXX = try container.decode(Bool.self, forKey: .isCXX)
+        self.cLanguageStandard = try container.decodeIfPresent(String.self, forKey: .cLanguageStandard)
+        self.cxxLanguageStandard = try container.decodeIfPresent(String.self, forKey: .cxxLanguageStandard)
+        try super.init(from: decoder)
+    }
+}
+
+public class BinaryTarget: Target {
+
+    /// The original source of the binary artifact.
+    public enum ArtifactSource: Equatable {
+
+        /// Represents an artifact that was downloaded from a remote URL.
+        case remote(url: String)
+
+        /// Represents an artifact that was available locally.
+        case local
+    }
+
+    /// The binary artifact's source.
+    public let artifactSource: ArtifactSource
+
+    /// The binary artifact path.
+    public var artifactPath: AbsolutePath {
+        return sources.root
+    }
+
+    public init(
+        name: String,
+        platforms: [SupportedPlatform] = [],
+        path: AbsolutePath,
+        artifactSource: ArtifactSource
+    ) {
+        self.artifactSource = artifactSource
+        let sources = Sources(paths: [], root: path)
+        super.init(
+            name: name,
+            defaultLocalization: nil,
+            platforms: platforms,
+            type: .binary,
+            sources: sources,
+            dependencies: [],
+            buildSettings: .init()
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case artifactSource
+    }
+
+    public override func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(artifactSource, forKey: .artifactSource)
+    }
+
+    required public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.artifactSource = try container.decode(ArtifactSource.self, forKey: .artifactSource)
+        try super.init(from: decoder)
+    }
+}
+
+/// A type of module map layout.  Contains all the information needed to generate or use a module map for a target that can have C-style headers.
+public enum ModuleMapType: Equatable, Codable {
+    /// No module map file.
+    case none
+    /// A custom module map file.
+    case custom(AbsolutePath)
+    /// An umbrella header included by a generated module map file.
+    case umbrellaHeader(AbsolutePath)
+    /// An umbrella directory included by a generated module map file.
+    case umbrellaDirectory(AbsolutePath)
+
+    private enum CodingKeys: String, CodingKey {
+        case none, custom, umbrellaHeader, umbrellaDirectory
+    }
+    
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let path = try container.decodeIfPresent(AbsolutePath.self, forKey: .custom) {
+            self = .custom(path)
+        }
+        else if let path = try container.decodeIfPresent(AbsolutePath.self, forKey: .umbrellaHeader) {
+            self = .umbrellaHeader(path)
+        }
+        else if let path = try container.decodeIfPresent(AbsolutePath.self, forKey: .umbrellaDirectory) {
+            self = .umbrellaDirectory(path)
+        }
+        else {
+            self = .none
+        }
+    }
+    
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .none:
+            break
+        case .custom(let path):
+            try container.encode(path, forKey: .custom)
+        case .umbrellaHeader(let path):
+            try container.encode(path, forKey: .umbrellaHeader)
+        case .umbrellaDirectory(let path):
+            try container.encode(path, forKey: .umbrellaDirectory)
+        }
     }
 }
 

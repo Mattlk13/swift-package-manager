@@ -12,7 +12,7 @@ import TSCBasic
 import TSCUtility
 
 /// A grouping of related source files.
-public struct Sources {
+public struct Sources: Codable {
     /// The root of the sources.
     public let root: AbsolutePath
 
@@ -37,6 +37,16 @@ public struct Sources {
                 return false
             }
             return SupportedLanguageExtension.cppExtensions.contains(ext)
+        })
+    }
+
+    /// Returns true if the sources contain C++ files.
+    public var containsObjcFiles: Bool {
+        return paths.contains(where: {
+            guard let ext = $0.extension else {
+                return false
+            }
+            return ext == SupportedLanguageExtension.m.rawValue
         })
     }
 }

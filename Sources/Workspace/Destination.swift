@@ -1,6 +1,7 @@
 import TSCBasic
-import Build
 import TSCUtility
+import Build
+import SPMBuildCore
 
 public enum DestinationError: Swift.Error {
     /// Couldn't find the Xcode installation.
@@ -22,7 +23,7 @@ extension DestinationError: CustomStringConvertible {
 }
 
 /// The compilation destination, has information about everything that's required for a certain destination.
-public struct Destination: Encodable {
+public struct Destination: Encodable, Equatable {
 
     /// The clang/LLVM triple describing the target OS and architecture.
     ///
@@ -34,13 +35,16 @@ public struct Destination: Encodable {
     ///  - abi = eabi, gnu, android, macho, elf, etc.
     ///
     /// for more information see //https://clang.llvm.org/docs/CrossCompilation.html
-    public let target: Triple
+    public var target: Triple?
+
+    /// The architectures to build for. We build for host architecture if this is empty.
+    public var archs: [String] = []
 
     /// The SDK used to compile for the destination.
-    public let sdk: AbsolutePath
+    public var sdk: AbsolutePath?
 
     /// The binDir in the containing the compilers/linker to be used for the compilation.
-    public let binDir: AbsolutePath
+    public var binDir: AbsolutePath
 
     /// Additional flags to be passed to the C compiler.
     public let extraCCFlags: [String]
@@ -51,27 +55,33 @@ public struct Destination: Encodable {
     /// Additional flags to be passed when compiling with C++.
     public let extraCPPFlags: [String]
 
+    /// Creates a compilation destination with the specified properties.
+    public init(
+      target: Triple? = nil,
+      sdk: AbsolutePath?,
+      binDir: AbsolutePath,
+      extraCCFlags: [String] = [],
+      extraSwiftCFlags: [String] = [],
+      extraCPPFlags: [String] = []
+    ) {
+      self.target = target
+      self.sdk = sdk
+      self.binDir = binDir
+      self.extraCCFlags = extraCCFlags
+      self.extraSwiftCFlags = extraSwiftCFlags
+      self.extraCPPFlags = extraCPPFlags
+    }
+
     /// Returns the bin directory for the host.
     ///
     /// - Parameter originalWorkingDirectory: The working directory when the program was launched.
     private static func hostBinDir(
         originalWorkingDirectory: AbsolutePath? = localFileSystem.currentWorkingDirectory
     ) -> AbsolutePath {
-      #if Xcode
-        // For Xcode, set bin directory to the build directory containing the fake
-        // toolchain created during bootstraping. This is obviously not production ready
-        // and only exists as a development utility right now.
-        //
-        // This also means that we should have bootstrapped with the same Swift toolchain
-        // we're using inside Xcode otherwise we will not be able to load the runtime libraries.
-        return AbsolutePath(#file).parentDirectory
-            .parentDirectory.parentDirectory.appending(components: ".build", hostTargetTriple.tripleString, "debug")
-      #else
         guard let cwd = originalWorkingDirectory else {
             return try! AbsolutePath(validating: CommandLine.arguments[0]).parentDirectory
         }
         return AbsolutePath(CommandLine.arguments[0], relativeTo: cwd).parentDirectory
-      #endif
     }
 
     /// The destination describing the host OS.
@@ -87,64 +97,85 @@ public struct Destination: Encodable {
         let binDir = customBinDir ?? binDir ?? Destination.hostBinDir(
             originalWorkingDirectory: originalWorkingDirectory)
 
-      #if os(macOS)
+        let sdkPath: AbsolutePath?
+#if os(macOS)
         // Get the SDK.
-        let sdkPath: AbsolutePath
         if let value = lookupExecutablePath(filename: ProcessEnv.vars["SDKROOT"]) {
             sdkPath = value
         } else {
             // No value in env, so search for it.
             let sdkPathStr = try Process.checkNonZeroExit(
-                arguments: ["xcrun", "--sdk", "macosx", "--show-sdk-path"], environment: environment).spm_chomp()
+                arguments: ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], environment: environment).spm_chomp()
             guard !sdkPathStr.isEmpty else {
                 throw DestinationError.invalidInstallation("default SDK not found")
             }
             sdkPath = AbsolutePath(sdkPathStr)
         }
+#else
+        sdkPath = nil
+#endif
 
         // Compute common arguments for clang and swift.
-        // This is currently just frameworks path.
-        let commonArgs = Destination.sdkPlatformFrameworkPath(environment: environment).map({ ["-F", $0.pathString] }) ?? []
+        var extraCCFlags: [String] = []
+        var extraSwiftCFlags: [String] = []
+#if os(macOS)
+        if let sdkPaths = Destination.sdkPlatformFrameworkPaths(environment: environment) {
+            extraCCFlags += ["-F", sdkPaths.fwk.pathString]
+            extraSwiftCFlags += ["-F", sdkPaths.fwk.pathString]
+            extraSwiftCFlags += ["-I", sdkPaths.lib.pathString]
+            extraSwiftCFlags += ["-L", sdkPaths.lib.pathString]
+        }
+#endif
+
+#if !os(Windows)
+        extraCCFlags += ["-fPIC"]
+#endif
+
+        var extraCPPFlags: [String] = []
+#if os(macOS)
+        extraCPPFlags += ["-lc++"]
+#elseif os(Windows)
+        extraCPPFlags += []
+#else
+        extraCPPFlags += ["-lstdc++"]
+#endif
 
         return Destination(
-            target: hostTargetTriple,
+            target: nil,
             sdk: sdkPath,
             binDir: binDir,
-            extraCCFlags: commonArgs,
-            extraSwiftCFlags: commonArgs,
-            extraCPPFlags: ["-lc++"]
+            extraCCFlags: extraCCFlags,
+            extraSwiftCFlags: extraSwiftCFlags,
+            extraCPPFlags: extraCPPFlags
         )
-      #else
-        return Destination(
-            target: hostTargetTriple,
-            sdk: .root,
-            binDir: binDir,
-            extraCCFlags: ["-fPIC"],
-            extraSwiftCFlags: [],
-            extraCPPFlags: ["-lstdc++"]
-        )
-      #endif
     }
 
     /// Returns macosx sdk platform framework path.
-    public static func sdkPlatformFrameworkPath(environment: [String:String] = ProcessEnv.vars) -> AbsolutePath? {
+    public static func sdkPlatformFrameworkPaths(
+        environment: [String: String] = ProcessEnv.vars
+    ) -> (fwk: AbsolutePath, lib: AbsolutePath)? {
         if let path = _sdkPlatformFrameworkPath {
             return path
         }
         let platformPath = try? Process.checkNonZeroExit(
-            arguments: ["xcrun", "--sdk", "macosx", "--show-sdk-platform-path"], environment: environment).spm_chomp()
+            arguments: ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-platform-path"],
+            environment: environment).spm_chomp()
 
         if let platformPath = platformPath, !platformPath.isEmpty {
-           _sdkPlatformFrameworkPath = AbsolutePath(platformPath).appending(
+            // For XCTest framework.
+            let fwk = AbsolutePath(platformPath).appending(
                 components: "Developer", "Library", "Frameworks")
+
+            // For XCTest Swift library.
+            let lib = AbsolutePath(platformPath).appending(
+                components: "Developer", "usr", "lib")
+
+            _sdkPlatformFrameworkPath = (fwk, lib)
         }
         return _sdkPlatformFrameworkPath
     }
     /// Cache storage for sdk platform path.
-    private static var _sdkPlatformFrameworkPath: AbsolutePath? = nil
-
-    /// Target triple for the host system.
-    private static let hostTargetTriple = Triple.hostTriple
+    private static var _sdkPlatformFrameworkPath: (fwk: AbsolutePath, lib: AbsolutePath)? = nil
 }
 
 extension Destination {

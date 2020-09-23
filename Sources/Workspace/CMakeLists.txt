@@ -11,24 +11,29 @@ add_library(Workspace
   Diagnostics.swift
   Export.swift
   InitPackage.swift
-  ManagedDependency.swift
+  misc.swift
+  ResolverPrecomputationProvider.swift
   ToolsVersionWriter.swift
   UserToolchain.swift
   Workspace.swift
-  misc.swift)
+  WorkspaceState.swift
+  WindowsToolchainInfo.swift)
 target_link_libraries(Workspace PUBLIC
   TSCBasic
   TSCUtility
   Build
   PackageGraph
+  PackageLoading
   PackageModel
   SourceControl
   Xcodeproj)
+target_link_libraries(PackageLoading PUBLIC
+  $<$<NOT:$<PLATFORM_ID:Darwin>>:Foundation>)
 # NOTE(compnerd) workaround for CMake not setting up include flags yet
 set_target_properties(Workspace PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_Swift_MODULE_DIRECTORY})
 
-if(CMAKE_SYSTEM_NAME STREQUAL Windows)
+if(USE_CMAKE_INSTALL)
 install(TARGETS Workspace
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

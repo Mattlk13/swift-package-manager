@@ -8,8 +8,6 @@
 
 add_library(Commands
   APIDigester.swift
-  Completions+bash.swift
-  Completions+zsh.swift
   Describe.swift
   Error.swift
   GenerateLinuxMain.swift
@@ -21,20 +19,27 @@ add_library(Commands
   SwiftRunTool.swift
   SwiftTestTool.swift
   SwiftTool.swift
+  SymbolGraphExtract.swift
   WatchmanHelper.swift)
 target_link_libraries(Commands PUBLIC
-  TSCBasic
+  ArgumentParser
   Build
   PackageGraph
   SourceControl
+  TSCBasic
   TSCUtility
-  Xcodeproj
-  Workspace)
+  Workspace
+  XCBuildSupport
+  Xcodeproj)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL Darwin)
+  target_link_libraries(Commands PUBLIC
+    FoundationXML)
+endif()
 # NOTE(compnerd) workaround for CMake not setting up include flags yet
 set_target_properties(Commands PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_Swift_MODULE_DIRECTORY})
 
-if(CMAKE_SYSTEM_NAME STREQUAL Windows)
+if(USE_CMAKE_INSTALL)
 install(TARGETS Commands
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib

@@ -49,7 +49,7 @@ extension ProductType: Codable {
 
 extension SystemPackageProviderDescription: Codable {
     private enum CodingKeys: String, CodingKey {
-        case brew, apt
+        case brew, apt, yum
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -60,6 +60,9 @@ extension SystemPackageProviderDescription: Codable {
             try unkeyedContainer.encode(a1)
         case let .apt(a1):
             var unkeyedContainer = container.nestedUnkeyedContainer(forKey: .apt)
+            try unkeyedContainer.encode(a1)
+        case let .yum(a1):
+            var unkeyedContainer = container.nestedUnkeyedContainer(forKey: .yum)
             try unkeyedContainer.encode(a1)
         }
     }
@@ -78,6 +81,10 @@ extension SystemPackageProviderDescription: Codable {
             var unkeyedValues = try values.nestedUnkeyedContainer(forKey: key)
             let a1 = try unkeyedValues.decode([String].self)
             self = .apt(a1)
+        case .yum:
+            var unkeyedValues = try values.nestedUnkeyedContainer(forKey: key)
+            let a1 = try unkeyedValues.decode([String].self)
+            self = .yum(a1)
         }
     }
 }
@@ -143,16 +150,19 @@ extension TargetDescription.Dependency: Codable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .target(a1):
+        case let .target(a1, a2):
             var unkeyedContainer = container.nestedUnkeyedContainer(forKey: .target)
             try unkeyedContainer.encode(a1)
-        case let .product(a1, a2):
+            try unkeyedContainer.encode(a2)
+        case let .product(a1, a2, a3):
             var unkeyedContainer = container.nestedUnkeyedContainer(forKey: .product)
             try unkeyedContainer.encode(a1)
             try unkeyedContainer.encode(a2)
-        case let .byName(a1):
+            try unkeyedContainer.encode(a3)
+        case let .byName(a1, a2):
             var unkeyedContainer = container.nestedUnkeyedContainer(forKey: .byName)
             try unkeyedContainer.encode(a1)
+            try unkeyedContainer.encode(a2)
         }
     }
 
@@ -165,16 +175,78 @@ extension TargetDescription.Dependency: Codable {
         case .target:
             var unkeyedValues = try values.nestedUnkeyedContainer(forKey: key)
             let a1 = try unkeyedValues.decode(String.self)
-            self = .target(name: a1)
+            let a2 = try unkeyedValues.decodeIfPresent(PackageConditionDescription.self)
+            self = .target(name: a1, condition: a2)
         case .product:
             var unkeyedValues = try values.nestedUnkeyedContainer(forKey: key)
             let a1 = try unkeyedValues.decode(String.self)
             let a2 = try unkeyedValues.decodeIfPresent(String.self)
-            self = .product(name: a1, package: a2)
+            let a3 = try unkeyedValues.decodeIfPresent(PackageConditionDescription.self)
+            self = .product(name: a1, package: a2, condition: a3)
         case .byName:
             var unkeyedValues = try values.nestedUnkeyedContainer(forKey: key)
             let a1 = try unkeyedValues.decode(String.self)
-            self = .byName(name: a1)
+            let a2 = try unkeyedValues.decodeIfPresent(PackageConditionDescription.self)
+            self = .byName(name: a1, condition: a2)
+        }
+    }
+}
+
+/// Wrapper for package condition so it can be conformed to Codable.
+struct PackageConditionWrapper: Codable {
+    var platform: PlatformsCondition?
+    var config: ConfigurationCondition?
+
+    var condition: PackageConditionProtocol {
+        if let platform = platform {
+            return platform
+        } else if let config = config {
+            return config
+        } else {
+            fatalError("unreachable")
+        }
+    }
+
+    init(_ condition: PackageConditionProtocol) {
+        switch condition {
+        case let platform as PlatformsCondition:
+            self.platform = platform
+        case let config as ConfigurationCondition:
+            self.config = config
+        default:
+            fatalError("unknown condition \(condition)")
+        }
+    }
+}
+
+extension BinaryTarget.ArtifactSource: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case remote, local
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .remote(let a1):
+            var unkeyedContainer = container.nestedUnkeyedContainer(forKey: .remote)
+            try unkeyedContainer.encode(a1)
+        case .local:
+            try container.encodeNil(forKey: .local)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard let key = values.allKeys.first(where: values.contains) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Did not find a matching key"))
+        }
+        switch key {
+        case .remote:
+            var unkeyedValues = try values.nestedUnkeyedContainer(forKey: key)
+            let a1 = try unkeyedValues.decode(String.self)
+            self = .remote(url: a1)
+        case .local:
+            self = .local
         }
     }
 }

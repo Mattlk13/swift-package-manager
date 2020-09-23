@@ -16,44 +16,9 @@ import SPMTestSupport
 import PackageModel
 import PackageLoading
 
-// FIXME: We should share the infra with other loading tests.
-class PackageDescription5LoadingTests: XCTestCase {
-    let manifestLoader = ManifestLoader(manifestResources: Resources.default)
-
-    private func loadManifestThrowing(
-        _ contents: ByteString,
-        toolsVersion: ToolsVersion = .v5,
-        line: UInt = #line,
-        body: (Manifest) -> Void
-    ) throws {
-        let fs = InMemoryFileSystem()
-        let manifestPath = AbsolutePath.root.appending(component: Manifest.filename)
-        try fs.writeFileContents(manifestPath, bytes: contents)
-        let m = try manifestLoader.load(
-            package: AbsolutePath.root,
-            baseURL: "/foo",
-            toolsVersion: toolsVersion,
-            fileSystem: fs)
-        guard m.toolsVersion == toolsVersion else {
-            return XCTFail("Invalid manfiest version")
-        }
-        body(m)
-    }
-
-    private func loadManifest(
-        _ contents: ByteString,
-        toolsVersion: ToolsVersion = .v5,
-        line: UInt = #line,
-        body: (Manifest) -> Void
-    ) {
-        do {
-            try loadManifestThrowing(contents, toolsVersion: toolsVersion, line: line, body: body)
-        } catch ManifestParseError.invalidManifestFormat(let error, _) {
-            print(error)
-            XCTFail(file: #file, line: line)
-        } catch {
-            XCTFail("Unexpected error: \(error)", file: #file, line: line)
-        }
+class PackageDescription5LoadingTests: PackageDescriptionLoadingTests {
+    override var toolsVersion: ToolsVersion {
+        .v5
     }
 
     func testBasics() {
@@ -64,7 +29,7 @@ class PackageDescription5LoadingTests: XCTestCase {
                 name: "Trivial",
                 products: [
                     .executable(name: "tool", targets: ["tool"]),
-                    .library(name: "Foo", targets: ["Foo"]),
+                    .library(name: "Foo", targets: ["foo"]),
                 ],
                 dependencies: [
                     .package(url: "/foo1", from: "1.0.0"),
@@ -73,6 +38,8 @@ class PackageDescription5LoadingTests: XCTestCase {
                     .target(
                         name: "foo",
                         dependencies: ["dep1", .product(name: "product"), .target(name: "target")]),
+                    .target(
+                        name: "tool"),
                     .testTarget(
                         name: "bar",
                         dependencies: ["foo"]),
@@ -84,21 +51,19 @@ class PackageDescription5LoadingTests: XCTestCase {
             XCTAssertEqual(manifest.name, "Trivial")
 
             // Check targets.
-            let targets = Dictionary(uniqueKeysWithValues:
-                manifest.targets.map({ ($0.name, $0 as TargetDescription ) }))
-            let foo = targets["foo"]!
+            let foo = manifest.targetMap["foo"]!
             XCTAssertEqual(foo.name, "foo")
             XCTAssertFalse(foo.isTest)
             XCTAssertEqual(foo.dependencies, ["dep1", .product(name: "product"), .target(name: "target")])
 
-            let bar = targets["bar"]!
+            let bar = manifest.targetMap["bar"]!
             XCTAssertEqual(bar.name, "bar")
             XCTAssertTrue(bar.isTest)
             XCTAssertEqual(bar.dependencies, ["foo"])
 
             // Check dependencies.
             let deps = Dictionary(uniqueKeysWithValues: manifest.dependencies.map{ ($0.url, $0) })
-            XCTAssertEqual(deps["/foo1"], PackageDependencyDescription(url: "/foo1", requirement: .upToNextMajor(from: "1.0.0")))
+            XCTAssertEqual(deps["/foo1"], PackageDependencyDescription(name: nil, url: "/foo1", requirement: .upToNextMajor(from: "1.0.0")))
 
             // Check products.
             let products = Dictionary(uniqueKeysWithValues: manifest.products.map{ ($0.name, $0) })
@@ -111,7 +76,7 @@ class PackageDescription5LoadingTests: XCTestCase {
             let fooProduct = products["Foo"]!
             XCTAssertEqual(fooProduct.name, "Foo")
             XCTAssertEqual(fooProduct.type, .library(.automatic))
-            XCTAssertEqual(fooProduct.targets, ["Foo"])
+            XCTAssertEqual(fooProduct.targets, ["foo"])
         }
     }
 
@@ -148,6 +113,28 @@ class PackageDescription5LoadingTests: XCTestCase {
 
             XCTAssertMatch(message, .contains("'v3' is unavailable"))
             XCTAssertMatch(message, .contains("'v3' was obsoleted in PackageDescription 5"))
+        }
+    }
+
+    func testPlatformOptions() throws {
+        let stream = BufferedOutputByteStream()
+        stream <<< """
+            import PackageDescription
+            let package = Package(
+               name: "Foo",
+               platforms: [
+                   .macOS("10.13.option1.option2"), .iOS("12.2.option2"),
+                   .tvOS("12.3.4.option5.option7.option9")
+               ]
+            )
+            """
+
+        loadManifest(stream.bytes) { manifest in
+            XCTAssertEqual(manifest.platforms, [
+                PlatformDescription(name: "macos", version: "10.13", options: ["option1", "option2"]),
+                PlatformDescription(name: "ios", version: "12.2", options: ["option2"]),
+                PlatformDescription(name: "tvos", version: "12.3.4", options: ["option5", "option7", "option9"]),
+            ])
         }
     }
 
@@ -190,7 +177,13 @@ class PackageDescription5LoadingTests: XCTestCase {
             try loadManifestThrowing(stream.bytes) { _ in }
             XCTFail("Unexpected success")
         } catch ManifestParseError.runtimeManifestErrors(let errors) {
-            XCTAssertEqual(errors, ["invalid macOS version string: -11.2", "invalid iOS version string: 12.x.2", "invalid tvOS version string: 10..2", "invalid watchOS version string: 1.0"])
+            print(errors.joined(separator: "\n"))
+            XCTAssertEqual(errors, [
+                "invalid macOS version -11.2; -11 should be a positive integer",
+                "invalid iOS version 12.x.2; x should be a positive integer",
+                "invalid tvOS version 10..2; found an empty component",
+                "invalid watchOS version 1.0; the minimum major version should be 2",
+            ])
         }
 
         // Duplicates.
@@ -236,7 +229,7 @@ class PackageDescription5LoadingTests: XCTestCase {
             let package = Package(
                name: "Foo",
                platforms: [
-                   .macOS(.v10_15), .iOS(.v13),
+                   .macOS(.v11), .iOS(.v14),
                ]
             )
             """
@@ -249,9 +242,34 @@ class PackageDescription5LoadingTests: XCTestCase {
                 return XCTFail("\(error)")
             }
 
-            XCTAssertMatch(message, .contains("error: 'v10_15' is unavailable"))
-            XCTAssertMatch(message, .contains("note: 'v10_15' was introduced in PackageDescription 5.1"))
-            XCTAssertMatch(message, .contains("note: 'v13' was introduced in PackageDescription 5.1"))
+            XCTAssertMatch(message, .contains("error: 'v11' is unavailable"))
+            XCTAssertMatch(message, .contains("note: 'v11' was introduced in PackageDescription 5.3"))
+            XCTAssertMatch(message, .contains("note: 'v14' was introduced in PackageDescription 5.3"))
+        }
+
+        // Newer OS version alias (now marked as unavailable).
+        stream = BufferedOutputByteStream()
+        stream <<< """
+            import PackageDescription
+            let package = Package(
+               name: "Foo",
+               platforms: [
+                   .macOS(.v10_16), .iOS(.v14),
+               ]
+            )
+            """
+
+        do {
+            try loadManifestThrowing(stream.bytes) { _ in }
+            XCTFail("Unexpected success")
+        } catch {
+            guard case let ManifestParseError.invalidManifestFormat(message, _) = error else {
+                return XCTFail("\(error)")
+            }
+
+            XCTAssertMatch(message, .contains("error: 'v10_16' has been renamed to 'v11'"))
+            XCTAssertMatch(message, .contains("note: 'v10_16' has been explicitly marked unavailable here"))
+            XCTAssertMatch(message, .contains("note: 'v14' was introduced in PackageDescription 5.3"))
         }
     }
 
@@ -331,9 +349,11 @@ class PackageDescription5LoadingTests: XCTestCase {
                 _ = try loader.load(
                     package: manifestPath.parentDirectory,
                     baseURL: manifestPath.pathString,
-                    toolsVersion: .v5)
+                    toolsVersion: .v5,
+                    packageKind: .local
+                )
             } catch ManifestParseError.invalidManifestFormat(let error, let diagnosticFile) {
-                XCTAssertMatch(error, .contains("expected \')\' in expression list"))
+                XCTAssertMatch(error, .contains("expected expression in container literal"))
                 let contents = try localFileSystem.readFileContents(diagnosticFile!)
                 XCTAssertNotNil(contents)
             }
@@ -360,6 +380,7 @@ class PackageDescription5LoadingTests: XCTestCase {
                 package: manifestPath.parentDirectory,
                 baseURL: manifestPath.pathString,
                 toolsVersion: .v5,
+                packageKind: .local,
                 diagnostics: diagnostics
             )
 
@@ -410,49 +431,7 @@ class PackageDescription5LoadingTests: XCTestCase {
             )
             """
 
-        do {
-            try loadManifestThrowing(stream.bytes) { _ in }
-            XCTFail("Unexpected success")
-        } catch ManifestParseError.runtimeManifestErrors(let errors) {
-            XCTAssertEqual(errors, ["cSettings cannot be an empty array; provide at least one setting or remove it"])
-        }
-    }
-
-    func testResources() throws {
-        let stream = BufferedOutputByteStream()
-        stream <<< """
-            import PackageDescription
-            let package = Package(
-               name: "Foo",
-               targets: [
-                   .target(
-                       name: "Foo",
-                       __resources: [
-                           .copy("foo.txt"),
-                           .process("bar.txt"),
-                       ]
-                   ),
-               ]
-            )
-            """
-
-        do {
-            try loadManifestThrowing(stream.bytes) { _ in }
-            XCTFail("Unexpected success")
-        } catch {
-            guard case let ManifestParseError.invalidManifestFormat(message, _) = error else {
-                return XCTFail("\(error)")
-            }
-
-            XCTAssertMatch(message, .contains("is unavailable"))
-            XCTAssertMatch(message, .contains("was introduced in PackageDescription 5.2"))
-        }
-
-        loadManifest(stream.bytes, toolsVersion: .v5_2) { manifest in
-            let resources = manifest.targets[0].resources
-            XCTAssertEqual(resources[0], TargetDescription.Resource(rule: .copy, path: "foo.txt"))
-            XCTAssertEqual(resources[1], TargetDescription.Resource(rule: .process, path: "bar.txt"))
-        }
+        try loadManifestThrowing(stream.bytes) { _ in }
     }
 
     func testWindowsPlatform() throws {
@@ -488,15 +467,61 @@ class PackageDescription5LoadingTests: XCTestCase {
             XCTAssertEqual(manifest.name, "Foo")
 
             // Check targets.
-            let targets = Dictionary(uniqueKeysWithValues:
-                manifest.targets.map({ ($0.name, $0 as TargetDescription ) }))
-            let foo = targets["foo"]!
+            let foo = manifest.targetMap["foo"]!
             XCTAssertEqual(foo.name, "foo")
             XCTAssertFalse(foo.isTest)
             XCTAssertEqual(foo.dependencies, [])
 
-            let settings = manifest.targets[0].settings
+            let settings = foo.settings
             XCTAssertEqual(settings[0], .init(tool: .c, name: .define, value: ["LLVM_ON_WIN32"], condition: .init(platformNames: ["windows"])))
+        }
+    }
+
+    func testPackageNameUnavailable() throws {
+        let stream = BufferedOutputByteStream()
+        stream <<< """
+            import PackageDescription
+            let package = Package(
+                name: "Trivial",
+                products: [],
+                dependencies: [
+                    .package(name: "Foo", url: "/foo1", from: "1.0.0"),
+                ],
+                targets: [
+                    .target(
+                        name: "foo",
+                        dependencies: [.product(name: "product", package: "Foo")]),
+                ]
+            )
+            """
+
+        do {
+            try loadManifestThrowing(stream.bytes) { _ in }
+            XCTFail()
+        } catch {
+            guard case let ManifestParseError.invalidManifestFormat(message, _) = error else {
+                return XCTFail("\(error)")
+            }
+
+            XCTAssertMatch(message, .contains("is unavailable"))
+            XCTAssertMatch(message, .contains("was introduced in PackageDescription 5.2"))
+        }
+    }
+
+    func testManifestWithPrintStatements() {
+        let stream = BufferedOutputByteStream()
+        stream <<< """
+            import PackageDescription
+            print(String(repeating: "Hello manifest... ", count: 65536))
+            let package = Package(
+                name: "PackageWithChattyManifest"
+            )
+            """
+        loadManifest(stream.bytes) { manifest in
+            XCTAssertEqual(manifest.name, "PackageWithChattyManifest")
+            XCTAssertEqual(manifest.toolsVersion, .v5)
+            XCTAssertEqual(manifest.targets, [])
+            XCTAssertEqual(manifest.dependencies, [])
         }
     }
 }

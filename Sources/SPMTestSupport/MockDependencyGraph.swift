@@ -146,6 +146,7 @@ public struct MockManifestGraph {
             url: path.pathString,
             version: nil,
             toolsVersion: .v4,
+            packageKind: .root,
             dependencies: MockManifestGraph.createDependencies(repos: repos, dependencies: rootDeps)
         )
 
@@ -159,6 +160,7 @@ public struct MockManifestGraph {
                 url: url,
                 version: package.version,
                 toolsVersion: .v4,
+                packageKind: .remote,
                 dependencies: MockManifestGraph.createDependencies(repos: repos, dependencies: package.dependencies)
             )
             return (MockManifestLoader.Key(url: url, version: package.version), manifest)
@@ -178,6 +180,7 @@ public struct MockManifestGraph {
     ) -> [PackageDependencyDescription] {
         return dependencies.map({ dependency in
             return PackageDependencyDescription(
+                name: dependency.name,
                 url: repos[dependency.name]?.url ?? "//\(dependency.name)",
                 requirement: .range(dependency.version.lowerBound ..< dependency.version.upperBound))
         })

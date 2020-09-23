@@ -1,4 +1,4 @@
-// swift-tools-version:5.2
+// swift-tools-version:5.3
 import PackageDescription
 
 let package = Package(
@@ -6,14 +6,14 @@ let package = Package(
     targets: [
         .target(
             name: "SwiftyResource",
-            __resources: [
+            resources: [
                 .copy("foo.txt"),
             ]
         ),
 
         .target(
             name: "SeaResource",
-            __resources: [
+            resources: [
                 .copy("foo.txt"),
             ]
         ),

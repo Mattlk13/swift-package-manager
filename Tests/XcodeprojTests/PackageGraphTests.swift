@@ -14,7 +14,7 @@ import TSCBasic
 import PackageGraph
 import SPMTestSupport
 import PackageModel
-@testable import Xcodeproj
+import Xcodeproj
 
 class PackageGraphTests: XCTestCase {
     func testBasics() throws {
@@ -34,12 +34,13 @@ class PackageGraphTests: XCTestCase {
         )
 
         let diagnostics = DiagnosticsEngine()
-        let g = loadPackageGraph(root: "/Bar", fs: fs, diagnostics: diagnostics,
+        let g = loadPackageGraph(fs: fs, diagnostics: diagnostics,
             manifests: [
                 Manifest.createV4Manifest(
                     name: "Foo",
                     path: "/Foo",
                     url: "/Foo",
+                    packageKind: .local,
                     products: [
                         ProductDescription(name: "Foo", targets: ["Foo"])
                     ],
@@ -58,8 +59,9 @@ class PackageGraphTests: XCTestCase {
                     name: "Bar",
                     path: "/Bar",
                     url: "/Bar",
+                    packageKind: .root,
                     dependencies: [
-                        PackageDependencyDescription(url: "/Foo", requirement: .upToNextMajor(from: "1.0.0"))
+                        PackageDependencyDescription(name: "Foo", url: "/Foo", requirement: .upToNextMajor(from: "1.0.0"))
                     ],
                     targets: [
                         TargetDescription(name: "Bar", dependencies: ["Foo"]),
@@ -121,6 +123,7 @@ class PackageGraphTests: XCTestCase {
                 XCTAssertEqual(targetResult.target.buildSettings.debug.SWIFT_ACTIVE_COMPILATION_CONDITIONS, ["DMACOS"])
                 XCTAssertNil(targetResult.target.buildSettings.release.SWIFT_ACTIVE_COMPILATION_CONDITIONS)
 
+                XCTAssertEqual(targetResult.commonBuildSettings.CURRENT_PROJECT_VERSION, "1")
                 XCTAssertEqual(targetResult.commonBuildSettings.OTHER_CFLAGS?.first, "$(inherited)")
                 XCTAssertEqual(targetResult.commonBuildSettings.OTHER_LDFLAGS?.first, "$(inherited)")
                 XCTAssertEqual(targetResult.commonBuildSettings.OTHER_SWIFT_FLAGS?.first, "$(inherited)")
@@ -132,6 +135,7 @@ class PackageGraphTests: XCTestCase {
             result.check(target: "Bar") { targetResult in
                 targetResult.check(productType: .framework)
                 targetResult.check(dependencies: ["Foo"])
+                XCTAssertEqual(targetResult.commonBuildSettings.CURRENT_PROJECT_VERSION, "1")
                 XCTAssertEqual(targetResult.commonBuildSettings.LD_RUNPATH_SEARCH_PATHS ?? [], ["$(inherited)", "$(TOOLCHAIN_DIR)/usr/lib/swift/macosx"])
                 XCTAssertEqual(targetResult.commonBuildSettings.OTHER_CFLAGS?.first, "$(inherited)")
                 XCTAssertEqual(targetResult.commonBuildSettings.OTHER_LDFLAGS?.first, "$(inherited)")
@@ -143,6 +147,7 @@ class PackageGraphTests: XCTestCase {
             result.check(target: "Sea") { targetResult in
                 targetResult.check(productType: .framework)
                 targetResult.check(dependencies: ["Foo"])
+                XCTAssertEqual(targetResult.commonBuildSettings.CURRENT_PROJECT_VERSION, "1")
                 XCTAssertEqual(targetResult.commonBuildSettings.CLANG_ENABLE_MODULES, "YES")
                 XCTAssertEqual(targetResult.commonBuildSettings.DEFINES_MODULE, "YES")
                 XCTAssertEqual(targetResult.commonBuildSettings.MODULEMAP_FILE, nil)
@@ -157,6 +162,7 @@ class PackageGraphTests: XCTestCase {
                 targetResult.check(productType: .framework)
                 targetResult.check(dependencies: ["Foo"])
                 XCTAssertNil(targetResult.commonBuildSettings.CLANG_ENABLE_MODULES)
+                XCTAssertEqual(targetResult.commonBuildSettings.CURRENT_PROJECT_VERSION, "1")
                 XCTAssertEqual(targetResult.commonBuildSettings.DEFINES_MODULE, "NO")
                 XCTAssertEqual(targetResult.commonBuildSettings.MODULEMAP_FILE, nil)
                 XCTAssertEqual(targetResult.commonBuildSettings.OTHER_CFLAGS?.first, "$(inherited)")
@@ -169,6 +175,7 @@ class PackageGraphTests: XCTestCase {
             result.check(target: "Sea3") { targetResult in
                 targetResult.check(productType: .framework)
                 XCTAssertNil(targetResult.commonBuildSettings.CLANG_ENABLE_MODULES)
+                XCTAssertEqual(targetResult.commonBuildSettings.CURRENT_PROJECT_VERSION, "1")
                 XCTAssertEqual(targetResult.commonBuildSettings.DEFINES_MODULE, "NO")
                 XCTAssertEqual(targetResult.commonBuildSettings.MODULEMAP_FILE, nil)
             }
@@ -191,12 +198,13 @@ class PackageGraphTests: XCTestCase {
         )
 
         let diagnostics = DiagnosticsEngine()
-        let g = loadPackageGraph(root: "/Foo", fs: fs, diagnostics: diagnostics,
+        let g = loadPackageGraph(fs: fs, diagnostics: diagnostics,
             manifests: [
                 Manifest.createV4Manifest(
                     name: "Foo",
                     path: "/Foo",
                     url: "/Foo",
+                    packageKind: .root,
                     products: [
                         ProductDescription(name: "Bar", type: .library(.dynamic), targets: ["Foo"])
                     ],
@@ -231,12 +239,13 @@ class PackageGraphTests: XCTestCase {
         )
 
         let diagnostics = DiagnosticsEngine()
-        let g = loadPackageGraph(root: "/Bar", fs: fs, diagnostics: diagnostics,
+        let g = loadPackageGraph(fs: fs, diagnostics: diagnostics,
             manifests: [
                 Manifest.createV4Manifest(
                     name: "Bar",
                     path: "/Bar",
                     url: "/Bar",
+                    packageKind: .root,
                     targets: [
                         TargetDescription(name: "Sea", dependencies: []),
                         TargetDescription(name: "Sea2", dependencies: []),
@@ -273,12 +282,13 @@ class PackageGraphTests: XCTestCase {
         )
 
         let diagnostics = DiagnosticsEngine()
-        let g = loadPackageGraph(root: "/Pkg", fs: fs, diagnostics: diagnostics,
+        let g = loadPackageGraph(fs: fs, diagnostics: diagnostics,
             manifests: [
                 Manifest.createV4Manifest(
                     name: "Pkg",
                     path: "/Pkg",
                     url: "/Pkg",
+                    packageKind: .root,
                     targets: [
                         TargetDescription(name: "HelperTool", dependencies: []),
                         TargetDescription(name: "Library", dependencies: []),
@@ -335,12 +345,13 @@ class PackageGraphTests: XCTestCase {
       	)
 
         let diagnostics = DiagnosticsEngine()
-        let graph = loadPackageGraph(root: "/Foo", fs: fs, diagnostics: diagnostics,
+        let graph = loadPackageGraph(fs: fs, diagnostics: diagnostics,
             manifests: [
                 Manifest.createV4Manifest(
                     name: "Foo",
                     path: "/Foo",
                     url: "/Foo",
+                    packageKind: .root,
                     targets: [
                         TargetDescription(name: "a"),
                         TargetDescription(name: "b", dependencies: ["a"]),
@@ -387,12 +398,13 @@ class PackageGraphTests: XCTestCase {
             )
 
             let diagnostics = DiagnosticsEngine()
-            let graph = loadPackageGraph(root: "/Foo", fs: fs, diagnostics: diagnostics,
+            let graph = loadPackageGraph(fs: fs, diagnostics: diagnostics,
                 manifests: [
                     Manifest.createV4Manifest(
                         name: "Foo",
                         path: "/Foo",
                         url: "/Foo",
+                        packageKind: .root,
                         swiftLanguageVersions: [SwiftLanguageVersion(string: swiftVersion)!],
                         targets: [
                             TargetDescription(name: "a"),

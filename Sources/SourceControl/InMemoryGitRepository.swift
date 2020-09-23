@@ -145,23 +145,25 @@ public final class InMemoryGitRepository {
         let headFs = head.fileSystem
 
         /// Recursively copies the content at HEAD to fs.
-        func install(at path: AbsolutePath) throws {
-            guard headFs.isDirectory(path) else { return }
-            for entry in try headFs.getDirectoryContents(path) {
+        func install(from sourcePath: AbsolutePath, to destinationPath: AbsolutePath) throws {
+            assert(headFs.isDirectory(sourcePath))
+            for entry in try headFs.getDirectoryContents(sourcePath) {
                 // The full path of the entry.
-                let entryPath = path.appending(component: entry)
-                if headFs.isFile(entryPath) {
+                let sourceEntryPath = sourcePath.appending(component: entry)
+                let destinationEntryPath = destinationPath.appending(component: entry)
+                if headFs.isFile(sourceEntryPath) {
                     // If we have a file just write the file.
-                    try fs.writeFileContents(entryPath, bytes: try headFs.readFileContents(entryPath))
-                } else if headFs.isDirectory(entryPath) {
+                    let bytes = try headFs.readFileContents(sourceEntryPath)
+                    try fs.writeFileContents(destinationEntryPath, bytes: bytes)
+                } else if headFs.isDirectory(sourceEntryPath) {
                     // If we have a directory, create that directory and copy its contents.
-                    try fs.createDirectory(entryPath, recursive: false)
-                    try install(at: entryPath)
+                    try fs.createDirectory(destinationEntryPath, recursive: false)
+                    try install(from: sourceEntryPath, to: destinationEntryPath)
                 }
             }
         }
         // Install at the repository path.
-        try install(at: path)
+        try install(from: .root, to: path)
     }
 
     /// Tag the current HEAD with the given name.
@@ -207,6 +209,10 @@ extension InMemoryGitRepository: FileSystem {
         return AbsolutePath("/")
     }
 
+    public func changeCurrentWorkingDirectory(to path: AbsolutePath) throws {
+        fatalError("Unsupported")
+    }
+
     public var homeDirectory: AbsolutePath {
         fatalError("Unsupported")
     }
@@ -235,6 +241,14 @@ extension InMemoryGitRepository: FileSystem {
     public func chmod(_ mode: FileMode, path: AbsolutePath, options: Set<FileMode.Option>) throws {
         try head.fileSystem.chmod(mode, path: path, options: options)
     }
+
+    public func copy(from sourcePath: AbsolutePath, to destinationPath: AbsolutePath) throws {
+        try head.fileSystem.copy(from: sourcePath, to: destinationPath)
+    }
+
+    public func move(from sourcePath: AbsolutePath, to destinationPath: AbsolutePath) throws {
+        try head.fileSystem.move(from: sourcePath, to: destinationPath)
+    }
 }
 
 extension InMemoryGitRepository: Repository {
@@ -251,8 +265,7 @@ extension InMemoryGitRepository: Repository {
     }
 
     public func openFileView(revision: Revision) throws -> FileSystem {
-        let fs: FileSystem = history[revision.identifier]!.fileSystem
-        return RerootedFileSystemView(fs, rootedAt: path)
+        return history[revision.identifier]!.fileSystem
     }
 }
 
@@ -328,7 +341,6 @@ public final class InMemoryGitRepositoryProvider: RepositoryProvider {
     ) throws {
         let checkout = fetchedMap[sourcePath]!.copy(at: destinationPath)
         checkoutsMap[destinationPath] = checkout
-        try checkout.installHead()
     }
 
     public func checkoutExists(at path: AbsolutePath) throws -> Bool {

@@ -14,6 +14,8 @@ import SourceControl
 import PackageModel
 
 public final class PinsStore {
+    public typealias PinsMap = [PackageReference.PackageIdentity: PinsStore.Pin]
+
     public struct Pin {
         /// The package reference of the pinned dependency.
         public let packageRef: PackageReference
@@ -21,7 +23,7 @@ public final class PinsStore {
         /// The pinned state.
         public let state: CheckoutState
 
-        init(
+        public init(
             packageRef: PackageReference,
             state: CheckoutState
         ) {
@@ -42,9 +44,7 @@ public final class PinsStore {
     fileprivate var fileSystem: FileSystem
 
     /// The pins map.
-    ///
-    /// Key -> Package Identity.
-    public fileprivate(set) var pinsMap: [String: Pin]
+    public fileprivate(set) var pinsMap: PinsMap
 
     /// The current pins.
     public var pins: AnySequence<Pin> {
@@ -69,8 +69,8 @@ public final class PinsStore {
         pinsMap = [:]
         do {
             _ = try self.persistence.restoreState(self)
-        } catch SimplePersistence.Error.restoreFailure {
-            throw StringError("Package.resolved file is corrupted or malformed; fix or delete the file to continue")
+        } catch SimplePersistence.Error.restoreFailure(_, let error) {
+            throw StringError("Package.resolved file is corrupted or malformed; fix or delete the file to continue: \(error)")
         }
     }
 
@@ -105,14 +105,6 @@ public final class PinsStore {
         // Reset the pins map.
         pinsMap = [:]
     }
-
-    /// Creates constraints based on the pins in the store.
-    public func createConstraints() -> [RepositoryPackageConstraint] {
-        return pins.map({ pin in
-            return RepositoryPackageConstraint(
-                container: pin.packageRef, requirement: pin.state.requirement())
-        })
-    }
 }
 
 /// Persistence.
@@ -131,7 +123,7 @@ extension PinsStore: SimplePersistanceProtocol {
     }
 
     public func restore(from json: JSON) throws {
-        self.pinsMap = try Dictionary(uniqueKeysWithValues: json.get("pins").map({ ($0.packageRef.identity, $0) }))
+        self.pinsMap = try Dictionary(json.get("pins").map({ ($0.packageRef.identity, $0) }), uniquingKeysWith: { first, _ in throw StringError("duplicated entry for package \"\(first.packageRef.name)\"") })
     }
 
     /// Saves the current state of pins.
@@ -148,7 +140,8 @@ extension PinsStore.Pin: JSONMappable, JSONSerializable, Equatable {
     public init(json: JSON) throws {
         let name: String? = json.get("package")
         let url: String = try json.get("repositoryURL")
-        let ref = PackageReference(identity: PackageReference.computeIdentity(packageURL: url), path: url)
+        let identity = PackageReference.computeIdentity(packageURL: url)
+        let ref = PackageReference(identity: identity, path: url)
         self.packageRef = name.flatMap(ref.with(newName:)) ?? ref
         self.state = try json.get("state")
     }
@@ -158,7 +151,7 @@ extension PinsStore.Pin: JSONMappable, JSONSerializable, Equatable {
         return .init([
             "package": packageRef.name.toJSON(),
             "repositoryURL": packageRef.path,
-            "state": state,
+            "state": state
         ])
     }
 }

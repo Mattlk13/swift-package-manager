@@ -19,13 +19,17 @@ public enum ModuleError: Swift.Error {
     public enum InvalidLayoutType {
         case multipleSourceRoots([AbsolutePath])
         case modulemapInSources(AbsolutePath)
+        case modulemapMissing(AbsolutePath)
     }
 
     /// Indicates two targets with the same name and their corresponding packages.
     case duplicateModule(String, [String])
 
-    /// The eferenced target could not be found.
+    /// The referenced target could not be found.
     case moduleNotFound(String, TargetDescription.TargetType)
+
+    /// The artifact for the binary target could not be found.
+    case artifactNotFound(String)
 
     /// Invalid custom path.
     case invalidCustomPath(target: String, path: String)
@@ -59,6 +63,9 @@ public enum ModuleError: Swift.Error {
 
     /// Invalid header search path.
     case invalidHeaderSearchPath(String)
+
+    /// Default localization not set in the presence of localized resources.
+    case defaultLocalizationNotSet
 }
 
 extension ModuleError: CustomStringConvertible {
@@ -70,6 +77,8 @@ extension ModuleError: CustomStringConvertible {
         case .moduleNotFound(let target, let type):
             let folderName = type == .test ? "Tests" : "Sources"
             return "Source files for target \(target) should be located under '\(folderName)/\(target)', or a custom sources path can be set with the 'path' property in Package.swift"
+        case .artifactNotFound(let target):
+            return "artifact not found for target '\(target)'"
         case .invalidLayout(let type):
             return "package has unsupported layout; \(type)"
         case .invalidManifestConfig(let package, let message):
@@ -99,6 +108,8 @@ extension ModuleError: CustomStringConvertible {
             return "invalid custom path '\(path)' for target '\(target)'"
         case .invalidHeaderSearchPath(let path):
             return "invalid header search path '\(path)'; header search path should not be outside the package root"
+        case .defaultLocalizationNotSet:
+            return "manifest property 'defaultLocalization' not set; it is required in the presence of localized resources"
         }
     }
 }
@@ -110,6 +121,8 @@ extension ModuleError.InvalidLayoutType: CustomStringConvertible {
           return "multiple source roots found: " + paths.map({ $0.description }).sorted().joined(separator: ", ")
         case .modulemapInSources(let path):
             return "modulemap '\(path)' should be inside the 'include' directory"
+        case .modulemapMissing(let path):
+            return "missing system target module map at '\(path)'"
         }
     }
 }
@@ -128,9 +141,6 @@ extension Target {
 
         /// The target contains an invalid mix of languages (e.g. both Swift and C).
         case mixedSources(AbsolutePath)
-
-        /// The manifest contains duplicate targets.
-        case duplicateTargets([String])
     }
 }
 
@@ -141,8 +151,6 @@ extension Target.Error: CustomStringConvertible {
             return "invalid target name at '\(path)'; \(problem)"
         case .mixedSources(let path):
             return "target at '\(path)' contains mixed language source files; feature not supported"
-        case .duplicateTargets(let targets):
-            return "duplicate targets found: " + targets.joined(separator: ", ")
         }
     }
 }
@@ -159,19 +167,31 @@ extension Target.Error.ModuleNameProblem: CustomStringConvertible {
 extension Product {
     /// An error in a product definition.
     enum Error: Swift.Error {
-        case noModules(String)
-        case moduleNotFound(product: String, target: String)
+        case moduleEmpty(product: String, target: String)
     }
 }
 
 extension Product.Error: CustomStringConvertible {
     var description: String {
         switch self {
-        case .noModules(let product):
-            return "product '\(product)' doesn't reference any targets"
-        case .moduleNotFound(let product, let target):
-            return "target '\(target)' referenced in product '\(product)' could not be found"
+        case .moduleEmpty(let product, let target):
+            return "target '\(target)' referenced in product '\(product)' is empty"
         }
+    }
+}
+
+/// A structure representing the remote artifact information necessary to construct the package.
+public struct RemoteArtifact {
+
+    /// The URl the artifact was downloaded from.
+    public let url: String
+
+    /// The path to the downloaded artifact.
+    public let path: AbsolutePath
+
+    public init(url: String, path: AbsolutePath) {
+        self.url = url
+        self.path = path
     }
 }
 
@@ -183,17 +203,20 @@ public final class PackageBuilder {
     /// The manifest for the package being constructed.
     private let manifest: Manifest
 
+    /// The product filter to apply to the package.
+    private let productFilter: ProductFilter
+
     /// The path of the package.
     private let packagePath: AbsolutePath
+
+    /// Information concerning the different downloaded binary target artifacts.
+    private let remoteArtifacts: [RemoteArtifact]
 
     /// The filesystem package builder will run on.
     private let fileSystem: FileSystem
 
     /// The diagnostics engine.
     private let diagnostics: DiagnosticsEngine
-
-    /// True if this is the root package.
-    private let isRootPackage: Bool
 
     /// Create multiple test products.
     ///
@@ -206,30 +229,37 @@ public final class PackageBuilder {
     /// The additionla file detection rules.
     private let additionalFileRules: [FileRuleDescription]
 
+    /// Minimum deployment target of XCTest per platform.
+    private let xcTestMinimumDeploymentTargets: [PackageModel.Platform:PlatformVersion]
+
     /// Create a builder for the given manifest and package `path`.
     ///
     /// - Parameters:
     ///   - manifest: The manifest of this package.
     ///   - path: The root path of the package.
+    ///   - artifactPaths: Paths to the downloaded binary target artifacts.
     ///   - fileSystem: The file system on which the builder should be run.
     ///   - diagnostics: The diagnostics engine.
-    ///   - isRootPackage: If this is a root package.
     ///   - createMultipleTestProducts: If enabled, create one test product for
     ///     each test target.
     public init(
         manifest: Manifest,
+        productFilter: ProductFilter,
         path: AbsolutePath,
         additionalFileRules: [FileRuleDescription] = [],
+        remoteArtifacts: [RemoteArtifact] = [],
+        xcTestMinimumDeploymentTargets: [PackageModel.Platform:PlatformVersion],
         fileSystem: FileSystem = localFileSystem,
         diagnostics: DiagnosticsEngine,
-        isRootPackage: Bool,
         shouldCreateMultipleTestProducts: Bool = false,
         createREPLProduct: Bool = false
     ) {
-        self.isRootPackage = isRootPackage
         self.manifest = manifest
+        self.productFilter = productFilter
         self.packagePath = path
         self.additionalFileRules = additionalFileRules
+        self.remoteArtifacts = remoteArtifacts
+        self.xcTestMinimumDeploymentTargets = xcTestMinimumDeploymentTargets
         self.fileSystem = fileSystem
         self.diagnostics = diagnostics
         self.shouldCreateMultipleTestProducts = shouldCreateMultipleTestProducts
@@ -242,19 +272,27 @@ public final class PackageBuilder {
     ///     - packagePath: The absolute path of the package root.
     ///     - swiftCompiler: The absolute path of a `swiftc` executable.
     ///         Its associated resources will be used by the loader.
+    ///     - kind: The kind of package.
     public static func loadPackage(
         packagePath: AbsolutePath,
         swiftCompiler: AbsolutePath,
+        swiftCompilerFlags: [String],
+        xcTestMinimumDeploymentTargets: [PackageModel.Platform:PlatformVersion]
+            = MinimumDeploymentTarget.default.xcTestMinimumDeploymentTargets,
         diagnostics: DiagnosticsEngine,
-        isRootPackage: Bool = true) throws -> Package {
-
+        kind: PackageReference.Kind = .root
+    ) throws -> Package {
         let manifest = try ManifestLoader.loadManifest(
-            packagePath: packagePath, swiftCompiler: swiftCompiler)
+            packagePath: packagePath,
+            swiftCompiler: swiftCompiler,
+            swiftCompilerFlags: swiftCompilerFlags,
+            packageKind: kind)
         let builder = PackageBuilder(
             manifest: manifest,
+            productFilter: .everything,
             path: packagePath,
-            diagnostics: diagnostics,
-            isRootPackage: isRootPackage)
+            xcTestMinimumDeploymentTargets: xcTestMinimumDeploymentTargets,
+            diagnostics: diagnostics)
         return try builder.construct()
     }
 
@@ -368,23 +406,14 @@ public final class PackageBuilder {
     /// Private function that creates and returns a list of targets defined by a package.
     private func constructTargets() throws -> [Target] {
 
-        // Ensure no dupicate target definitions are found.
-        let duplicateTargetNames: [String] = manifest.targets.map({ $0.name
-        }).spm_findDuplicates()
-
-        if !duplicateTargetNames.isEmpty {
-            throw Target.Error.duplicateTargets(duplicateTargetNames)
-        }
-
         // Check for a modulemap file, which indicates a system target.
         let moduleMapPath = packagePath.appending(component: moduleMapFilename)
         if fileSystem.isFile(moduleMapPath) {
 
             // Warn about any declared targets.
-            let targets = manifest.targets
-            if !targets.isEmpty {
+            if !manifest.targets.isEmpty {
                 diagnostics.emit(
-                    .systemPackageDeclaresTargets(targets: targets.map{ $0.name }),
+                    .systemPackageDeclaresTargets(targets: Array(manifest.targets.map({ $0.name }))),
                     location: diagnosticLocation()
                 )
             }
@@ -480,6 +509,12 @@ public final class PackageBuilder {
                     return path
                 }
                 throw ModuleError.invalidCustomPath(target: target.name, path: subpath)
+            } else if target.type == .binary {
+                if let artifact = remoteArtifacts.first(where: { $0.path.basenameWithoutExt == target.name }) {
+                    return artifact.path
+                } else {
+                    throw ModuleError.artifactNotFound(target.name)
+                }
             }
 
             // Check if target is present in the predefined directory.
@@ -501,7 +536,7 @@ public final class PackageBuilder {
 
         // Create potential targets.
         let potentialTargets: [PotentialModule]
-        potentialTargets = try manifest.targets.map({ target in
+        potentialTargets = try manifest.targetsRequired(for: productFilter).map({ target in
             let path = try findPath(for: target)
             return PotentialModule(name: target.name, path: path, type: target.type)
         })
@@ -511,29 +546,28 @@ public final class PackageBuilder {
     // Create targets from the provided potential targets.
     private func createModules(_ potentialModules: [PotentialModule]) throws -> [Target] {
         // Find if manifest references a target which isn't present on disk.
-        let allReferencedModules = manifest.allReferencedModules()
+        let allVisibleModuleNames = manifest.visibleModuleNames(for: productFilter)
         let potentialModulesName = Set(potentialModules.map({ $0.name }))
-        let missingModules = allReferencedModules.subtracting(potentialModulesName).intersection(allReferencedModules)
-        if let missingModule = missingModules.first {
-            throw ModuleError.moduleNotFound(missingModule, potentialModules.first(where: { $0.name == missingModule })?.type ?? .regular)
+        let missingModuleNames = allVisibleModuleNames.subtracting(potentialModulesName)
+        if let missingModuleName = missingModuleNames.first {
+            let type = potentialModules.first(where: { $0.name == missingModuleName })?.type ?? .regular
+            throw ModuleError.moduleNotFound(missingModuleName, type)
         }
 
-        let targetItems = manifest.targets.map({ ($0.name, $0 as TargetDescription) })
-        let targetMap = Dictionary(targetItems, uniquingKeysWith: { $1 })
         let potentialModuleMap = Dictionary(potentialModules.map({ ($0.name, $0) }), uniquingKeysWith: { $1 })
         let successors: (PotentialModule) -> [PotentialModule] = {
             // No reference of this target in manifest, i.e. it has no dependencies.
-            guard let target = targetMap[$0.name] else { return [] }
+            guard let target = self.manifest.targetMap[$0.name] else { return [] }
             return target.dependencies.compactMap({
                 switch $0 {
-                case .target(let name):
+                case .target(let name, _):
                     // Since we already checked above that all referenced targets
                     // has to present, we always expect this target to be present in
                     // potentialModules dictionary.
                     return potentialModuleMap[name]!
                 case .product:
                     return nil
-                case .byName(let name):
+                case .byName(let name, _):
                     // By name dependency may or may not be a target dependency.
                     return potentialModuleMap[name]
                 }
@@ -555,48 +589,49 @@ public final class PackageBuilder {
         for potentialModule in potentialModules.lazy.reversed() {
             // Validate the target name.  This function will throw an error if it detects a problem.
             try validateModuleName(potentialModule.path, potentialModule.name, isTest: potentialModule.isTest)
-            // Get the intra-package dependencies of this target.
-            let deps: [Target] = targetMap[potentialModule.name].map({
-                $0.dependencies.compactMap({
-                    switch $0 {
-                    case .target(let name):
-                        // We don't create an object for targets which have no sources.
-                        if emptyModules.contains(name) { return nil }
-                        return targets[name]!
-
-                    case .byName(let name):
-                        // We don't create an object for targets which have no sources.
-                        if emptyModules.contains(name) { return nil }
-                        return targets[name]
-
-                    case .product: return nil
-                    }
-                })
-            }) ?? []
 
             // Get the target from the manifest.
-            let manifestTarget = targetMap[potentialModule.name]
+            let manifestTarget = manifest.targetMap[potentialModule.name]
 
-            // Figure out the product dependencies.
-            let productDeps: [(String, String?)]
-            productDeps = manifestTarget?.dependencies.compactMap({
-                switch $0 {
-                case .target:
-                    return nil
-                case .byName(let name):
-                    // If this dependency was not found locally, it is a product dependency.
-                    return potentialModuleMap[name] == nil ? (name, nil) : nil
-                case .product(let name, let package):
-                    return (name, package)
+            // Get the dependencies of this target.
+            let dependencies: [Target.Dependency] = manifestTarget.map {
+                $0.dependencies.compactMap { dependency in
+                    switch dependency {
+                    case .target(let name, let condition):
+                        // We don't create an object for targets which have no sources.
+                        if emptyModules.contains(name) { return nil }
+                        guard let target = targets[name] else { return nil }
+                        return .target(target, conditions: buildConditions(from: condition))
+
+                    case .product(let name, let package, let condition):
+                        return .product(
+                            .init(name: name, package: package),
+                            conditions: buildConditions(from: condition)
+                        )
+
+                    case .byName(let name, let condition):
+                        // We don't create an object for targets which have no sources.
+                        if emptyModules.contains(name) { return nil }
+                        if let target = targets[name] {
+                            return .target(target, conditions: buildConditions(from: condition))
+                        } else if potentialModuleMap[name] == nil {
+                            return .product(
+                                .init(name: name, package: nil),
+                                conditions: buildConditions(from: condition)
+                            )
+                        } else {
+                            return nil
+                        }
+                    }
                 }
-            }) ?? []
+            } ?? []
 
             // Create the target.
             let target = try createTarget(
                 potentialModule: potentialModule,
                 manifestTarget: manifestTarget,
-                moduleDependencies: deps,
-                productDeps: productDeps)
+                dependencies: dependencies
+            )
             // Add the created target to the map or print no sources warning.
             if let createdTarget = target {
                 targets[createdTarget.name] = createdTarget
@@ -605,7 +640,7 @@ public final class PackageBuilder {
                 diagnostics.emit(.targetHasNoSources(targetPath: potentialModule.path.pathString, target: potentialModule.name))
             }
         }
-        return targets.values.map({ $0 })
+        return targets.values.map{ $0 }.sorted{ $0.name > $1.name  }
     }
 
     /// Private function that checks whether a target name is valid.  This method doesn't return anything, but rather,
@@ -622,8 +657,7 @@ public final class PackageBuilder {
     private func createTarget(
         potentialModule: PotentialModule,
         manifestTarget: TargetDescription?,
-        moduleDependencies: [Target],
-        productDeps: [(name: String, package: String?)]
+        dependencies: [Target.Dependency]
     ) throws -> Target? {
         guard let manifestTarget = manifestTarget else { return nil }
 
@@ -631,7 +665,7 @@ public final class PackageBuilder {
         if potentialModule.type == .system {
             let moduleMapPath = potentialModule.path.appending(component: moduleMapFilename)
             guard fileSystem.isFile(moduleMapPath) else {
-                return nil
+                throw ModuleError.invalidLayout(.modulemapMissing(moduleMapPath))
             }
 
             return SystemLibraryTarget(
@@ -641,10 +675,19 @@ public final class PackageBuilder {
                 pkgConfig: manifestTarget.pkgConfig,
                 providers: manifestTarget.providers
             )
+        } else if potentialModule.type == .binary {
+            let remoteURL = remoteArtifacts.first(where: { $0.path == potentialModule.path })
+            let artifactSource: BinaryTarget.ArtifactSource = remoteURL.map({ .remote(url: $0.url) }) ?? .local
+            return BinaryTarget(
+                name: potentialModule.name,
+                platforms: self.platforms(),
+                path: potentialModule.path,
+                artifactSource: artifactSource
+            )
         }
 
         // Check for duplicate target dependencies by name
-        let combinedDependencyNames = moduleDependencies.map { $0.name } + productDeps.map { $0.0 }
+        let combinedDependencyNames = dependencies.map { $0.target?.name ?? $0.product!.name }
         combinedDependencyNames.spm_findDuplicates().forEach {
             diagnostics.emit(.duplicateTargetDependency(dependency: $0, target: potentialModule.name))
         }
@@ -659,24 +702,24 @@ public final class PackageBuilder {
             throw ModuleError.invalidPublicHeadersDirectory(potentialModule.name)
         }
 
-        // Exclude public headers path directory from source searching if it's not
-        // the target root.
-        // FIXME: This means we'll try to assign rules to header files
-        // which is currently not handled by the sources builder.
-        let extraExcludes = publicHeadersPath != potentialModule.path ? [publicHeadersPath] : []
-
         let sourcesBuilder = TargetSourcesBuilder(
             packageName: manifest.name,
             packagePath: packagePath,
             target: manifestTarget,
             path: potentialModule.path,
+            defaultLocalization: manifest.defaultLocalization,
             additionalFileRules: additionalFileRules,
-            extraExcludes: extraExcludes,
             toolsVersion: manifest.toolsVersion,
             fs: fileSystem,
             diags: diagnostics
         )
-        let (sources, resources) = try sourcesBuilder.run()
+        let (sources, resources, headers) = try sourcesBuilder.run()
+
+        // Make sure defaultLocalization is set if the target has localized resources.
+        let hasLocalizedResources = resources.contains(where: { $0.localization != nil })
+        if hasLocalizedResources && manifest.defaultLocalization == nil {
+            throw ModuleError.defaultLocalizationNotSet
+        }
 
         // The name of the bundle, if one is being generated.
         let bundleName = resources.isEmpty ? nil : manifest.name + "_" + potentialModule.name
@@ -691,28 +734,43 @@ public final class PackageBuilder {
             return SwiftTarget(
                 name: potentialModule.name,
                 bundleName: bundleName,
-                platforms: self.platforms(),
+                defaultLocalization: manifest.defaultLocalization,
+                platforms: self.platforms(isTest: potentialModule.isTest),
                 isTest: potentialModule.isTest,
                 sources: sources,
                 resources: resources,
-                dependencies: moduleDependencies,
-                productDependencies: productDeps,
+                dependencies: dependencies,
                 swiftVersion: try swiftVersion(),
                 buildSettings: buildSettings
             )
         } else {
+            // It's not a Swift target, so it's a Clang target (those are the only two types of source target currently supported).
+            
+            // First determine the type of module map that will be appropriate for the target based on its header layout.
+            // FIXME: We should really be checking the target type to see whether it is one that can vend headers, not just check for the existence of the public headers path.  But right now we have now way of distinguishing between, for example, a library and an executable.  The semantics here should be to only try to detect the header layout of targets that can vend public headers.
+            let moduleMapType: ModuleMapType
+            if fileSystem.exists(publicHeadersPath) {
+                let moduleMapGenerator = ModuleMapGenerator(targetName: potentialModule.name, moduleName: potentialModule.name.spm_mangledToC99ExtendedIdentifier(), publicHeadersDir: publicHeadersPath, fileSystem: fileSystem)
+                moduleMapType = moduleMapGenerator.determineModuleMapType(diagnostics: diagnostics)
+            }
+            else {
+                moduleMapType = .none
+            }
+
             return ClangTarget(
                 name: potentialModule.name,
                 bundleName: bundleName,
-                platforms: self.platforms(),
+                defaultLocalization: manifest.defaultLocalization,
+                platforms: self.platforms(isTest: potentialModule.isTest),
                 cLanguageStandard: manifest.cLanguageStandard,
                 cxxLanguageStandard: manifest.cxxLanguageStandard,
                 includeDir: publicHeadersPath,
+                moduleMapType: moduleMapType,
+                headers: headers,
                 isTest: potentialModule.isTest,
                 sources: sources,
                 resources: resources,
-                dependencies: moduleDependencies,
-                productDependencies: productDeps,
+                dependencies: dependencies,
                 buildSettings: buildSettings
             )
         }
@@ -786,17 +844,7 @@ public final class PackageBuilder {
             // Create an assignment for this setting.
             var assignment = BuildSettings.Assignment()
             assignment.value = setting.value
-
-            if let config = setting.condition?.config.map({ BuildConfiguration(rawValue: $0)! }) {
-                let condition = BuildSettings.ConfigurationCondition(config)
-                assignment.conditions.append(condition)
-            }
-
-            if let platforms = setting.condition?.platformNames.map({ platformRegistry.platformByName[$0]! }), !platforms.isEmpty {
-                var condition = BuildSettings.PlatformsCondition()
-                condition.platforms = platforms
-                assignment.conditions.append(condition)
-            }
+            assignment.conditions = buildConditions(from: setting.condition)
 
             // Finally, add the assignment to the assignment table.
             table.add(assignment, for: decl)
@@ -805,9 +853,25 @@ public final class PackageBuilder {
         return table
     }
 
+    func buildConditions(from condition: PackageConditionDescription?) -> [PackageConditionProtocol] {
+        var conditions: [PackageConditionProtocol] = []
+
+        if let config = condition?.config.flatMap({ BuildConfiguration(rawValue: $0) }) {
+            let condition = ConfigurationCondition(configuration: config)
+            conditions.append(condition)
+        }
+
+        if let platforms = condition?.platformNames.compactMap({ platformRegistry.platformByName[$0] }), !platforms.isEmpty {
+            let condition = PlatformsCondition(platforms: platforms)
+            conditions.append(condition)
+        }
+
+        return conditions
+    }
+
     /// Returns the list of platforms supported by the manifest.
-    func platforms() -> [SupportedPlatform] {
-        if let platforms = _platforms {
+    func platforms(isTest: Bool = false) -> [SupportedPlatform] {
+        if let platforms = _platforms[isTest] {
             return platforms
         }
 
@@ -815,10 +879,17 @@ public final class PackageBuilder {
 
         /// Add each declared platform to the supported platforms list.
         for platform in manifest.platforms {
+            let declaredPlatform = platformRegistry.platformByName[platform.platformName]!
+            var version = PlatformVersion(platform.version)
+
+            if let xcTestMinimumDeploymentTarget = xcTestMinimumDeploymentTargets[declaredPlatform], isTest, version < xcTestMinimumDeploymentTarget {
+                version = xcTestMinimumDeploymentTarget
+            }
 
             let supportedPlatform = SupportedPlatform(
-                platform: platformRegistry.platformByName[platform.platformName]!,
-                version: PlatformVersion(platform.version)
+                platform: declaredPlatform,
+                version: version,
+                options: platform.options
             )
 
             supportedPlatforms.append(supportedPlatform)
@@ -828,21 +899,30 @@ public final class PackageBuilder {
         let remainingPlatforms = Set(platformRegistry.platformByName.keys).subtracting(supportedPlatforms.map({ $0.platform.name }))
 
         /// Start synthesizing for each undeclared platform.
-        for platformName in remainingPlatforms {
+        for platformName in remainingPlatforms.sorted() {
             let platform = platformRegistry.platformByName[platformName]!
+
+            let oldestSupportedVersion: PlatformVersion
+            if let xcTestMinimumDeploymentTarget = xcTestMinimumDeploymentTargets[platform], isTest {
+                oldestSupportedVersion = xcTestMinimumDeploymentTarget
+            } else {
+                oldestSupportedVersion = platform.oldestSupportedVersion
+            }
 
             let supportedPlatform = SupportedPlatform(
                 platform: platform,
-                version: platform.oldestSupportedVersion
+                version: oldestSupportedVersion,
+                options: []
             )
 
             supportedPlatforms.append(supportedPlatform)
         }
 
-        _platforms = supportedPlatforms
-        return _platforms!
+        _platforms[isTest] = supportedPlatforms
+        return supportedPlatforms
     }
-    private var _platforms: [SupportedPlatform]? = nil
+    // Keep two sets of supported platforms, based on the `isTest` parameter.
+    private var _platforms = [Bool:[SupportedPlatform]]()
 
     /// The platform registry instance.
     private var platformRegistry: PlatformRegistry {
@@ -879,16 +959,16 @@ public final class PackageBuilder {
     /// Validates that the sources of a target are not already present in another target.
     private func validateSourcesOverlapping(forTarget target: String, sources: [AbsolutePath]) throws {
         // Compute the sources which overlap with already computed targets.
-        var overlappingSources = [AbsolutePath]()
+        var overlappingSources: Set<AbsolutePath> = []
         for source in sources {
             if !allSources.insert(source).inserted {
-                overlappingSources.append(source)
+                overlappingSources.insert(source)
             }
         }
 
         // Throw if we found any overlapping sources.
         if !overlappingSources.isEmpty {
-            throw ModuleError.overlappingSources(target: target, sources: overlappingSources)
+            throw ModuleError.overlappingSources(target: target, sources: Array(overlappingSources))
         }
     }
 
@@ -988,21 +1068,18 @@ public final class PackageBuilder {
 
         /// Helper method to get targets from target names.
         func modulesFrom(targetNames names: [String], product: String) throws -> [Target] {
-            // Ensure the target names are non-empty.
-            guard !names.isEmpty else { throw Product.Error.noModules(product) }
             // Get targets from target names.
-            let productModules: [Target] = try names.map({ targetName in
+            return try names.map({ targetName in
                 // Ensure we have this target.
                 guard let target = modulesMap[targetName] else {
-                    throw Product.Error.moduleNotFound(product: product, target: targetName)
+                    throw Product.Error.moduleEmpty(product: product, target: targetName)
                 }
                 return target
             })
-            return productModules
         }
 
         // Only create implicit executables for root packages.
-        if isRootPackage {
+        if manifest.packageKind == .root {
             // Compute the list of targets which are being used in an
             // executable product so we don't create implicit executables
             // for them.
@@ -1027,7 +1104,14 @@ public final class PackageBuilder {
             }
         }
 
-        for product in manifest.products {
+        let filteredProducts: [ProductDescription]
+        switch productFilter {
+        case .everything:
+            filteredProducts = manifest.products
+        case .specific(let set):
+            filteredProducts = manifest.products.filter { set.contains($0.name) }
+        }
+        for product in filteredProducts {
             let targets = try modulesFrom(targetNames: product.targets, product: product.name)
             // Peform special validations if this product is exporting
             // a system library target.
@@ -1046,12 +1130,7 @@ public final class PackageBuilder {
             case .library, .test:
                 break
             case .executable:
-                let executableTargets = targets.filter({ $0.type == .executable })
-                if executableTargets.count != 1 {
-                    diagnostics.emit(
-                        .invalidExecutableProductDecl(product.name),
-                        location: diagnosticLocation()
-                    )
+                guard validateExecutableProduct(product, with: targets) else {
                     continue
                 }
             }
@@ -1080,6 +1159,33 @@ public final class PackageBuilder {
         return products.map({ $0.item })
     }
 
+    private func validateExecutableProduct(_ product: ProductDescription, with targets: [Target]) -> Bool {
+        let executableTargetCount = targets.filter { $0.type == .executable }.count
+        guard executableTargetCount == 1 else {
+            if executableTargetCount == 0 {
+                if let target = targets.spm_only {
+                    diagnostics.emit(
+                        .executableProductTargetNotExecutable(product: product.name, target: target.name),
+                        location: diagnosticLocation()
+                    )
+                } else {
+                    diagnostics.emit(
+                        .executableProductWithoutExecutableTarget(product: product.name),
+                        location: diagnosticLocation()
+                    )
+                }
+            } else {
+                diagnostics.emit(
+                    .executableProductWithMoreThanOneExecutableTarget(product: product.name),
+                    location: diagnosticLocation()
+                )
+            }
+
+            return false
+        }
+
+        return true
+    }
 }
 
 /// We create this structure after scanning the filesystem for potential targets.
@@ -1111,12 +1217,12 @@ private struct PotentialModule: Hashable {
 }
 
 private extension Manifest {
-    /// Returns the names of all the referenced targets in the manifest.
-    func allReferencedModules() -> Set<String> {
-        let names = targets.flatMap({ target in
+    /// Returns the names of all the visible targets in the manifest.
+    func visibleModuleNames(for productFilter: ProductFilter) -> Set<String> {
+        let names = targetsRequired(for: productFilter).flatMap({ target in
             [target.name] + target.dependencies.compactMap({
                 switch $0 {
-                case .target(let name):
+                case .target(let name, _):
                     return name
                 case .byName, .product:
                     return nil

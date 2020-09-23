@@ -36,12 +36,13 @@ public struct BuildManifest {
         return result
     }
 
-    func createTarget(_ name: TargetName) -> Target {
-        Target(name: name, nodes: [])
+    public mutating func createTarget(_ name: TargetName) {
+        guard !targets.keys.contains(name) else { return }
+        targets[name] = Target(name: name, nodes: [])
     }
 
     public mutating func addNode(_ node: Node, toTarget target: TargetName) {
-        targets[target, default: createTarget(target)].nodes.append(node)
+        targets[target, default: Target(name: target, nodes: [])].nodes.append(node)
     }
 
     public mutating func addPhonyCmd(
@@ -107,6 +108,24 @@ public struct BuildManifest {
         commands[name] = Command(name: name, tool: tool)
     }
 
+    public mutating func addSwiftFrontendCmd(
+        name: String,
+        moduleName: String,
+        description: String,
+        inputs: [Node],
+        outputs: [Node],
+        args: [String]
+    ) {
+        let tool = SwiftFrontendTool(
+                moduleName: moduleName,
+                description: description,
+                inputs: inputs,
+                outputs: outputs,
+                args: args
+        )
+        commands[name] = Command(name: name, tool: tool)
+    }
+
     public mutating func addClangCmd(
         name: String,
         description: String,
@@ -154,6 +173,7 @@ public struct BuildManifest {
             isLibrary: isLibrary,
             WMO: WMO
         )
+      
         commands[name] = Command(name: name, tool: tool)
     }
 }

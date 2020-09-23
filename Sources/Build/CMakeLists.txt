@@ -8,26 +8,30 @@
 
 add_library(Build
   BuildDelegate.swift
-  BuildParameters.swift
-  BuildPlan.swift
   BuildOperation.swift
-  Sanitizers.swift
-  SwiftCompilerOutputParser.swift
-  Toolchain.swift
+  BuildPlan.swift
   ManifestBuilder.swift
-  Triple.swift)
+  SPMSwiftDriverExecutor.swift
+  SwiftCompilerOutputParser.swift
+  XCFrameworkInfo.swift)
 target_link_libraries(Build PUBLIC
   TSCBasic
   PackageGraph
-  LLBuildManifest)
+  LLBuildManifest
+  SPMBuildCore
+  CYaml
+  Yams)
+target_link_libraries(Build PRIVATE
+  SwiftDriver)
 
 # NOTE(compnerd) workaround for CMake not setting up include flags yet
 set_target_properties(Build PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_Swift_MODULE_DIRECTORY})
 
-if(CMAKE_SYSTEM_NAME STREQUAL Windows)
+if(USE_CMAKE_INSTALL)
 install(TARGETS Build
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 endif()
+set_property(GLOBAL APPEND PROPERTY SwiftPM_EXPORTS Build)

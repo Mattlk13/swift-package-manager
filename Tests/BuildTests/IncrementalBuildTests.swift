@@ -39,7 +39,7 @@ final class IncrementalBuildTests: XCTestCase {
     func testIncrementalSingleModuleCLibraryInSources() {
         fixture(name: "CFamilyTargets/CLibrarySources") { prefix in
             // Build it once and capture the log (this will be a full build).
-            let fullLog = try executeSwiftBuild(prefix)
+            let (fullLog, _) = try executeSwiftBuild(prefix)
 
             // Check various things that we expect to see in the full build log.
             // FIXME:  This is specific to the format of the log output, which
@@ -49,18 +49,18 @@ final class IncrementalBuildTests: XCTestCase {
             let llbuildManifest = prefix.appending(components: ".build", "debug.yaml")
 
             // Modify the source file in a way that changes its size so that the low-level
-            // build system can detect the change. The timestamp change might be too less
-            // for it to detect.
+            // build system can detect the change (the timestamp change might be too small
+            // for the granularity of the file system to represent as distinct values).
             let sourceFile = prefix.appending(components: "Sources", "Foo.c")
-            let stream = BufferedOutputByteStream()
-            stream <<< (try localFileSystem.readFileContents(sourceFile)) <<< "\n"
-            try localFileSystem.writeFileContents(sourceFile, bytes: stream.bytes)
+            let sourceStream = BufferedOutputByteStream()
+            sourceStream <<< (try localFileSystem.readFileContents(sourceFile)) <<< "\n"
+            try localFileSystem.writeFileContents(sourceFile, bytes: sourceStream.bytes)
 
             // Read the first llbuild manifest.
             let llbuildContents1 = try localFileSystem.readFileContents(llbuildManifest)
 
             // Now build again.  This should be an incremental build.
-            let log2 = try executeSwiftBuild(prefix)
+            let (log2, _) = try executeSwiftBuild(prefix)
             XCTAssertTrue(log2.contains("Compiling CLibrarySources Foo.c"))
 
             // Read the second llbuild manifest.
@@ -68,7 +68,7 @@ final class IncrementalBuildTests: XCTestCase {
 
             // Now build again without changing anything.  This should be a null
             // build.
-            let log3 = try executeSwiftBuild(prefix)
+            let (log3, _) = try executeSwiftBuild(prefix)
             XCTAssertFalse(log3.contains("Compiling CLibrarySources Foo.c"))
 
             // Read the third llbuild manifest.
@@ -76,6 +76,18 @@ final class IncrementalBuildTests: XCTestCase {
 
             XCTAssertEqual(llbuildContents1, llbuildContents2)
             XCTAssertEqual(llbuildContents2, llbuildContents3)
+
+            // Modify the header file in a way that changes its size so that the low-level
+            // build system can detect the change (the timestamp change might be too small
+            // for the granularity of the file system to represent as distinct values).
+            let headerFile = prefix.appending(components: "Sources", "include", "Foo.h")
+            let headerStream = BufferedOutputByteStream()
+            headerStream <<< (try localFileSystem.readFileContents(headerFile)) <<< "\n"
+            try localFileSystem.writeFileContents(headerFile, bytes: headerStream.bytes)
+
+            // Now build again.  This should be an incremental build.
+            let (log4, _) = try executeSwiftBuild(prefix)
+            XCTAssertTrue(log4.contains("Compiling CLibrarySources Foo.c"))
         }
     }
 
@@ -83,7 +95,7 @@ final class IncrementalBuildTests: XCTestCase {
         fixture(name: "ValidLayouts/SingleModule/Library") { prefix in
             @discardableResult
             func build() throws -> String {
-                return try executeSwiftBuild(prefix, extraArgs: ["--enable-build-manifest-caching"])
+                return try executeSwiftBuild(prefix, extraArgs: ["--enable-build-manifest-caching"]).stdout
             }
 
             // Perform a full build.

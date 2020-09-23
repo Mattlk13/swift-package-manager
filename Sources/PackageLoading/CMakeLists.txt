@@ -10,6 +10,7 @@ add_library(PackageLoading
   Diagnostics.swift
   ManifestBuilder.swift
   ManifestLoader.swift
+  MinimumDeploymentTarget.swift
   ModuleMapGenerator.swift
   PackageBuilder.swift
   PackageDescription4Loader.swift
@@ -22,13 +23,16 @@ target_link_libraries(PackageLoading PUBLIC
   PackageModel
   TSCUtility
   SPMLLBuild)
+target_link_libraries(PackageLoading PUBLIC
+  $<$<NOT:$<PLATFORM_ID:Darwin>>:Foundation>)
 # NOTE(compnerd) workaround for CMake not setting up include flags yet
 set_target_properties(PackageLoading PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_Swift_MODULE_DIRECTORY})
 
-if(CMAKE_SYSTEM_NAME STREQUAL Windows)
+if(USE_CMAKE_INSTALL)
 install(TARGETS PackageLoading
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 endif()
+set_property(GLOBAL APPEND PROPERTY SwiftPM_EXPORTS PackageLoading)

@@ -1,7 +1,7 @@
 /*
  This source file is part of the Swift.org open source project
 
- Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+ Copyright (c) 2014 - 2020 Apple Inc. and the Swift project authors
  Licensed under Apache License v2.0 with Runtime Library Exception
 
  See http://swift.org/LICENSE.txt for license information
@@ -59,10 +59,10 @@ public class RepositoryPackageContainerProvider: PackageContainerProvider {
     public func getContainer(
         for identifier: PackageReference,
         skipUpdate: Bool,
-        completion: @escaping (Result<PackageContainer, AnyError>) -> Void
+        completion: @escaping (Result<PackageContainer, Swift.Error>) -> Void
     ) {
         // If the container is local, just create and return a local package container.
-        if identifier.isLocal {
+        if identifier.kind != .remote {
             callbacksQueue.async {
                 let container = LocalPackageContainer(identifier,
                     config: self.config,
@@ -78,7 +78,7 @@ public class RepositoryPackageContainerProvider: PackageContainerProvider {
         // Resolve the container using the repository manager.
         repositoryManager.lookup(repository: identifier.repository, skipUpdate: skipUpdate) { result in
             // Create the container wrapper.
-            let container = result.mapAny { handle -> PackageContainer in
+            let container = result.tryMap { handle -> PackageContainer in
                 // Open the repository.
                 //
                 // FIXME: Do we care about holding this open for the lifetime of the container.
@@ -107,7 +107,7 @@ extension PackageReference {
     ///
     /// This should only be accessed when the reference is not local.
     public var repository: RepositorySpecifier {
-        precondition(!isLocal)
+        precondition(kind == .remote)
         return RepositorySpecifier(url: path)
     }
 }
@@ -139,15 +139,15 @@ public class BasePackageContainer: PackageContainer {
         fatalError("This should never be called")
     }
 
-    public func getDependencies(at version: Version) throws -> [PackageContainerConstraint] {
+    public func getDependencies(at version: Version, productFilter: ProductFilter) throws -> [PackageContainerConstraint] {
         fatalError("This should never be called")
     }
 
-    public func getDependencies(at revision: String) throws -> [PackageContainerConstraint] {
+    public func getDependencies(at revision: String, productFilter: ProductFilter) throws -> [PackageContainerConstraint] {
         fatalError("This should never be called")
     }
 
-    public func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
+    public func getUnversionedDependencies(productFilter: ProductFilter) throws -> [PackageContainerConstraint] {
         fatalError("This should never be called")
     }
 
@@ -198,11 +198,8 @@ public class LocalPackageContainer: BasePackageContainer, CustomStringConvertibl
         // Load the tools version.
         let toolsVersion = try toolsVersionLoader.load(at: AbsolutePath(identifier.path), fileSystem: fs)
 
-        // Ensure current tools supports this package.
-        guard self.currentToolsVersion >= toolsVersion else {
-            // FIXME: Throw from here
-            fatalError()
-        }
+        // Validate the tools version.
+        try toolsVersion.validateToolsVersion(self.currentToolsVersion, packagePath: identifier.path)
 
         // Load the manifest.
         _manifest = try manifestLoader.load(
@@ -210,12 +207,13 @@ public class LocalPackageContainer: BasePackageContainer, CustomStringConvertibl
             baseURL: identifier.path,
             version: nil,
             toolsVersion: toolsVersion,
+            packageKind: identifier.kind,
             fileSystem: fs)
         return _manifest!
     }
 
-    public override func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
-        return try loadManifest().dependencyConstraints(config: config)
+    public override func getUnversionedDependencies(productFilter: ProductFilter) throws -> [PackageContainerConstraint] {
+        return try loadManifest().dependencyConstraints(productFilter: productFilter, config: config)
     }
 
     public override func getUpdatedIdentifier(at boundVersion: BoundVersion) throws -> Identifier {
@@ -253,21 +251,37 @@ public class RepositoryPackageContainer: BasePackageContainer, CustomStringConve
 
     // A wrapper for getDependencies() errors. This adds additional information
     // about the container to identify it for diagnostics.
-    public struct GetDependenciesErrorWrapper: Swift.Error {
+    public struct GetDependenciesError: Error, CustomStringConvertible, DiagnosticLocationProviding {
 
-        /// The container which had this error.
+        /// The container (repository) that encountered the error.
         public let containerIdentifier: String
 
-        /// The source control reference i.e. version, branch, revsion etc.
+        /// The source control reference (version, branch, revision, etc) that was involved.
         public let reference: String
 
         /// The actual error that occurred.
-        public let underlyingError: Swift.Error
+        public let underlyingError: Error
+        
+        /// Optional suggestion for how to resolve the error.
+        public let suggestion: String?
+        
+        public var diagnosticLocation: DiagnosticLocation? {
+            return PackageLocation.Remote(url: containerIdentifier, reference: reference)
+        }
+        
+        /// Description shown for errors of this kind.
+        public var description: String {
+            var desc = "\(underlyingError) in \(containerIdentifier)"
+            if let suggestion = suggestion {
+                desc += " (\(suggestion))"
+            }
+            return desc
+        }
     }
 
     /// This is used to remember if tools version of a particular version is
     /// valid or not.
-    private(set) var validToolsVersionsCache: [Version: Bool] = [:]
+    public private(set) var validToolsVersionsCache: [Version: Bool] = [:]
 
     /// The available version list (in reverse order).
     public override func versions(filter isIncluded: (Version) -> Bool) -> AnySequence<Version> {
@@ -364,29 +378,49 @@ public class RepositoryPackageContainer: BasePackageContainer, CustomStringConve
         return try toolsVersionLoader.load(at: .root, fileSystem: fs)
     }
 
-    public override func getDependencies(at version: Version) throws -> [RepositoryPackageConstraint] {
+    public override func getDependencies(at version: Version, productFilter: ProductFilter) throws -> [RepositoryPackageConstraint] {
         do {
             return try cachedDependencies(forIdentifier: version.description) {
                 let tag = knownVersions[version]!
                 let revision = try repository.resolveRevision(tag: tag)
-                return try getDependencies(at: revision, version: version)
+                return try getDependencies(at: revision, version: version, productFilter: productFilter)
             }.1
         } catch {
-            throw GetDependenciesErrorWrapper(
-                containerIdentifier: identifier.repository.url, reference: version.description, underlyingError: error)
+            throw GetDependenciesError(
+                containerIdentifier: identifier.repository.url, reference: version.description, underlyingError: error, suggestion: nil)
         }
     }
 
-    public override func getDependencies(at revision: String) throws -> [RepositoryPackageConstraint] {
+    public override func getDependencies(at revision: String, productFilter: ProductFilter) throws -> [RepositoryPackageConstraint] {
         do {
             return try cachedDependencies(forIdentifier: revision) {
                 // resolve the revision identifier and return its dependencies.
                 let revision = try repository.resolveRevision(identifier: revision)
-                return try getDependencies(at: revision)
+                return try getDependencies(at: revision, productFilter: productFilter)
             }.1
         } catch {
-            throw GetDependenciesErrorWrapper(
-                containerIdentifier: identifier.repository.url, reference: revision, underlyingError: error)
+            // Examine the error to see if we can come up with a more informative and actionable error message.  We know that the revision is expected to be a branch name or a hash (tags are handled through a different code path).
+            if let gitInvocationError = error as? ProcessResult.Error, gitInvocationError.description.contains("Needed a single revision") {
+                // It was a Git process invocation error.  Take a look at the repository to see if we can come up with a reasonable diagnostic.
+                if let rev = try? repository.resolveRevision(identifier: revision), repository.exists(revision: rev) {
+                    // Revision does exist, so something else must be wrong.
+                    throw GetDependenciesError(
+                        containerIdentifier: identifier.repository.url, reference: revision, underlyingError: error, suggestion: nil)
+                }
+                else {
+                    // Revision does not exist, so we customize the error.
+                    let sha1RegEx = try! RegEx(pattern: #"\A[:xdigit:]{40}\Z"#)
+                    let isBranchRev = sha1RegEx.matchGroups(in: revision).compactMap{ $0 }.isEmpty
+                    let errorMessage = "could not find " + (isBranchRev ? "a branch named ‘\(revision)’" : "the commit \(revision)")
+                    let mainBranchExists = (try? repository.resolveRevision(identifier: "main")) != nil
+                    let suggestion = (revision == "master" && mainBranchExists) ? "did you mean ‘main’?" : nil
+                    throw GetDependenciesError(
+                        containerIdentifier: identifier.repository.url, reference: revision,
+                        underlyingError: StringError(errorMessage), suggestion: suggestion)
+                }
+            }
+            // If we get this far without having thrown an error, we wrap and throw the underlying error.
+            throw GetDependenciesError(containerIdentifier: identifier.repository.url, reference: revision, underlyingError: error, suggestion: nil)
         }
     }
 
@@ -407,13 +441,14 @@ public class RepositoryPackageContainer: BasePackageContainer, CustomStringConve
     /// Returns dependencies of a container at the given revision.
     private func getDependencies(
         at revision: Revision,
-        version: Version? = nil
+        version: Version? = nil,
+        productFilter: ProductFilter
     ) throws -> (Manifest, [RepositoryPackageConstraint]) {
         let manifest = try loadManifest(at: revision, version: version)
-        return (manifest, manifest.dependencyConstraints(config: config))
+        return (manifest, manifest.dependencyConstraints(productFilter: productFilter, config: config))
     }
 
-    public override func getUnversionedDependencies() throws -> [PackageContainerConstraint] {
+    public override func getUnversionedDependencies(productFilter: ProductFilter) throws -> [PackageContainerConstraint] {
         // We just return an empty array if requested for unversioned dependencies.
         return []
     }
@@ -469,6 +504,7 @@ public class RepositoryPackageContainer: BasePackageContainer, CustomStringConve
             baseURL: packageURL,
             version: version,
             toolsVersion: toolsVersion,
+            packageKind: identifier.kind,
             fileSystem: fs)
     }
 }

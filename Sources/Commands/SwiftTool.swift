@@ -9,7 +9,10 @@
  */
 
 import func Foundation.NSUserName
+import class Foundation.ProcessInfo
+import Dispatch
 
+import ArgumentParser
 import TSCLibc
 import TSCBasic
 import TSCUtility
@@ -17,7 +20,9 @@ import TSCUtility
 import PackageModel
 import PackageGraph
 import SourceControl
+import SPMBuildCore
 import Build
+import XCBuildSupport
 import Workspace
 
 typealias Diagnostic = TSCBasic.Diagnostic
@@ -27,10 +32,30 @@ private class ToolWorkspaceDelegate: WorkspaceDelegate {
     /// The stream to use for reporting progress.
     private let stdoutStream: ThreadSafeOutputByteStream
 
-    init(_ stdoutStream: OutputByteStream) {
+    /// The progress animation for downloads.
+    private let downloadAnimation: NinjaProgressAnimation
+
+    /// Wether the tool is in a verbose mode.
+    private let isVerbose: Bool
+
+    private struct DownloadProgress {
+        let bytesDownloaded: Int64
+        let totalBytesToDownload: Int64
+    }
+
+    /// The progress of each individual downloads.
+    private var downloadProgress: [String: DownloadProgress] = [:]
+
+    private let queue = DispatchQueue(label: "org.swift.swiftpm.commands.tool-workspace-delegate")
+    private let diagnostics: DiagnosticsEngine
+
+    init(_ stdoutStream: OutputByteStream, isVerbose: Bool, diagnostics: DiagnosticsEngine) {
         // FIXME: Implement a class convenience initializer that does this once they are supported
         // https://forums.swift.org/t/allow-self-x-in-class-convenience-initializers/15924
         self.stdoutStream = stdoutStream as? ThreadSafeOutputByteStream ?? ThreadSafeOutputByteStream(stdoutStream)
+        self.downloadAnimation = NinjaProgressAnimation(stream: self.stdoutStream)
+        self.isVerbose = isVerbose
+        self.diagnostics = diagnostics
     }
 
     func fetchingWillBegin(repository: String) {
@@ -81,22 +106,91 @@ private class ToolWorkspaceDelegate: WorkspaceDelegate {
         stdoutStream <<< "\n"
         stdoutStream.flush()
     }
-}
 
-protocol ToolName {
-    static var toolName: String { get }
-}
+    func willResolveDependencies(reason: WorkspaceResolveReason) {
+        guard isVerbose else { return }
 
-extension ToolName {
-    static func otherToolNames() -> String {
-        let allTools: [ToolName.Type] = [SwiftBuildTool.self, SwiftRunTool.self, SwiftPackageTool.self, SwiftTestTool.self]
-        return  allTools.filter({ $0 != self }).map({ $0.toolName }).joined(separator: ", ")
+        stdoutStream <<< "Running resolver because "
+
+        switch reason {
+        case .forced:
+            stdoutStream <<< "it was forced"
+        case .newPackages(let packages):
+            let dependencies = packages.lazy.map({ "'\($0.path)'" }).joined(separator: ", ")
+            stdoutStream <<< "the following dependencies were added: \(dependencies)"
+        case .packageRequirementChange(let package, let state, let requirement):
+            stdoutStream <<< "dependency '\(package.name)' was "
+
+            switch state {
+            case .checkout(let checkoutState)?:
+                let requirement = checkoutState.requirement()
+                switch requirement {
+                case .versionSet(.exact(let version)):
+                    stdoutStream <<< "resolved to '\(version)'"
+                case .versionSet(_):
+                    // Impossible
+                    break
+                case .revision(let revision):
+                    stdoutStream <<< "resolved to '\(revision)'"
+                case .unversioned:
+                    stdoutStream <<< "unversioned"
+                }
+            case .edited?:
+                stdoutStream <<< "edited"
+            case .local?:
+                stdoutStream <<< "versioned"
+            case nil:
+                stdoutStream <<< "root"
+            }
+
+            stdoutStream <<< " but now has a "
+
+            switch requirement {
+            case .versionSet:
+                stdoutStream <<< "different version-based"
+            case .revision:
+                stdoutStream <<< "different revision-based"
+            case .unversioned:
+                stdoutStream <<< "unversioned"
+            }
+
+            stdoutStream <<< " requirement."
+        default:
+            stdoutStream <<< " requirements have changed."
+        }
+
+        stdoutStream <<< "\n"
+        stdoutStream.flush()
+    }
+
+    func downloadingBinaryArtifact(from url: String, bytesDownloaded: Int64, totalBytesToDownload: Int64?) {
+        queue.async {
+            if let totalBytesToDownload = totalBytesToDownload {
+                self.downloadProgress[url] = DownloadProgress(
+                    bytesDownloaded: bytesDownloaded,
+                    totalBytesToDownload: totalBytesToDownload)
+            }
+
+            let step = self.downloadProgress.values.reduce(0, { $0 + $1.bytesDownloaded }) / 1024
+            let total = self.downloadProgress.values.reduce(0, { $0 + $1.totalBytesToDownload }) / 1024
+            self.downloadAnimation.update(step: Int(step), total: Int(total), text: "Downloading binary artifacts")
+        }
+    }
+
+    func didDownloadBinaryArtifacts() {
+        queue.async {
+            if self.diagnostics.hasErrors {
+                self.downloadAnimation.clear()
+            }
+
+            self.downloadAnimation.complete(success: true)
+            self.downloadProgress.removeAll()
+        }
     }
 }
 
 /// Handler for the main DiagnosticsEngine used by the SwiftTool class.
 private final class DiagnosticsEngineHandler {
-
     /// The standard output stream.
     var stdoutStream = TSCBasic.stdoutStream
 
@@ -110,12 +204,30 @@ private final class DiagnosticsEngineHandler {
     }
 }
 
-public class SwiftTool<Options: ToolOptions> {
+protocol SwiftCommand: ParsableCommand {
+    var swiftOptions: SwiftToolOptions { get }
+  
+    func run(_ swiftTool: SwiftTool) throws
+}
+
+extension SwiftCommand {
+    public func run() throws {
+        let swiftTool = try SwiftTool(options: swiftOptions)
+        try self.run(swiftTool)
+        if swiftTool.diagnostics.hasErrors || swiftTool.executionStatus == .failure {
+            throw ExitCode.failure
+        }
+    }
+
+    public static var _errorLabel: String { "error" }
+}
+
+public class SwiftTool {
     /// The original working directory.
     let originalWorkingDirectory: AbsolutePath
 
     /// The options of this tool.
-    let options: Options
+    var options: SwiftToolOptions
 
     /// Path to the root package directory, nil if manifest is not found.
     let packageRoot: AbsolutePath?
@@ -144,9 +256,6 @@ public class SwiftTool<Options: ToolOptions> {
     /// Path to the build directory.
     let buildPath: AbsolutePath
 
-    /// Reference to the argument parser.
-    let parser: ArgumentParser
-
     /// The process set to hold the launched processes. These will be terminated on any signal
     /// received by the swift tools.
     let processSet: ProcessSet
@@ -170,200 +279,34 @@ public class SwiftTool<Options: ToolOptions> {
     /// Create an instance of this tool.
     ///
     /// - parameter args: The command line arguments to be passed to this tool.
-    public init(toolName: String, usage: String, overview: String, args: [String], seeAlso: String? = nil) {
+    public init(options: SwiftToolOptions) throws {
         // Capture the original working directory ASAP.
         guard let cwd = localFileSystem.currentWorkingDirectory else {
             diagnostics.emit(error: "couldn't determine the current working directory")
-            SwiftTool.exit(with: .failure)
+            throw ExitCode.failure
         }
         originalWorkingDirectory = cwd
 
-        // Create the parser.
-        parser = ArgumentParser(
-            commandName: "swift \(toolName)",
-            usage: usage,
-            overview: overview,
-            seeAlso: seeAlso)
-
-        // Create the binder.
-        let binder = ArgumentBinder<Options>()
-
-        // Bind the common options.
-        binder.bindArray(
-            parser.add(
-                option: "-Xcc", kind: [String].self, strategy: .oneByOne,
-                usage: "Pass flag through to all C compiler invocations"),
-            parser.add(
-                option: "-Xswiftc", kind: [String].self, strategy: .oneByOne,
-                usage: "Pass flag through to all Swift compiler invocations"),
-            parser.add(
-                option: "-Xlinker", kind: [String].self, strategy: .oneByOne,
-                usage: "Pass flag through to all linker invocations"),
-            to: {
-                $0.buildFlags.cCompilerFlags = $1
-                $0.buildFlags.swiftCompilerFlags = $2
-                $0.buildFlags.linkerFlags = $3
-            })
-        binder.bindArray(
-            option: parser.add(
-                option: "-Xcxx", kind: [String].self, strategy: .oneByOne,
-                usage: "Pass flag through to all C++ compiler invocations"),
-            to: { $0.buildFlags.cxxCompilerFlags = $1 })
-
-        binder.bind(
-            option: parser.add(
-                option: "--configuration", shortName: "-c", kind: BuildConfiguration.self,
-                usage: "Build with configuration (debug|release) [default: debug]"),
-            to: { $0.configuration = $1 })
-
-        binder.bind(
-            option: parser.add(
-                option: "--build-path", kind: PathArgument.self,
-                usage: "Specify build/cache directory [default: ./.build]"),
-            to: { $0.buildPath = $1.path })
-
-        binder.bind(
-            option: parser.add(
-                option: "--chdir", shortName: "-C", kind: PathArgument.self),
-            to: { $0.chdir = $1.path })
-
-        binder.bind(
-            option: parser.add(
-                option: "--package-path", kind: PathArgument.self,
-                usage: "Change working directory before any other operation"),
-            to: { $0.packagePath = $1.path })
-
-        binder.bind(
-            option: parser.add(
-                option: "--multiroot-data-file", kind: PathArgument.self, usage: nil),
-            to: { $0.multirootPackageDataFile = $1.path })
-
-        binder.bindArray(
-            option: parser.add(option: "--sanitize", kind: [Sanitizer].self,
-                strategy: .oneByOne, usage: "Turn on runtime checks for erroneous behavior"),
-            to: { $0.sanitizers = EnabledSanitizers(Set($1)) })
-
-        binder.bind(
-            option: parser.add(option: "--disable-prefetching", kind: Bool.self, usage: ""),
-            to: { $0.shouldEnableResolverPrefetching = !$1 })
-
-        binder.bind(
-            option: parser.add(option: "--skip-update", kind: Bool.self, usage: "Skip updating dependencies from their remote during a resolution"),
-            to: { $0.skipDependencyUpdate = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--disable-sandbox", kind: Bool.self,
-            usage: "Disable using the sandbox when executing subprocesses"),
-            to: { $0.shouldDisableSandbox = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--disable-package-manifest-caching", kind: Bool.self,
-            usage: "Disable caching Package.swift manifests"),
-            to: { $0.shouldDisableManifestCaching = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--version", kind: Bool.self),
-            to: { $0.shouldPrintVersion = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--destination", kind: PathArgument.self),
-            to: { $0.customCompileDestination = $1.path })
-
-        // FIXME: We need to allow -vv type options for this.
-        binder.bind(
-            option: parser.add(option: "--verbose", shortName: "-v", kind: Bool.self,
-                usage: "Increase verbosity of informational output"),
-            to: { $0.verbosity = $1 ? 1 : 0 })
-
-        binder.bind(
-            option: parser.add(option: "--no-static-swift-stdlib", kind: Bool.self,
-                usage: "Do not link Swift stdlib statically [default]"),
-            to: { $0.shouldLinkStaticSwiftStdlib = !$1 })
-
-        binder.bind(
-            option: parser.add(option: "--static-swift-stdlib", kind: Bool.self,
-                usage: "Link Swift stdlib statically"),
-            to: { $0.shouldLinkStaticSwiftStdlib = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--force-resolved-versions", kind: Bool.self),
-            to: { $0.forceResolvedVersions = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--disable-automatic-resolution", kind: Bool.self,
-               usage: "Disable automatic resolution if Package.resolved file is out-of-date"),
-            to: { $0.forceResolvedVersions = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--enable-index-store", kind: Bool.self,
-                usage: "Enable indexing-while-building feature"),
-            to: { if $1 { $0.indexStoreMode = .on } })
-
-        binder.bind(
-            option: parser.add(option: "--disable-index-store", kind: Bool.self,
-                usage: "Disable indexing-while-building feature"),
-            to: { if $1 { $0.indexStoreMode = .off } })
-
-        binder.bind(
-            option: parser.add(option: "--enable-pubgrub-resolver", kind: Bool.self,
-                usage: "Enable the new Pubgrub dependency resolver"),
-            to: { $0.enablePubgrubResolver = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--use-legacy-resolver", kind: Bool.self,
-                usage: "Use the legacy dependency resolver"),
-            to: { $0.enablePubgrubResolver = !$1 })
-
-        binder.bind(
-            option: parser.add(option: "--enable-parseable-module-interfaces", kind: Bool.self),
-            to: { $0.shouldEnableParseableModuleInterfaces = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--trace-resolver", kind: Bool.self),
-            to: { $0.enableResolverTrace = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--jobs", shortName: "-j", kind: Int.self,
-                usage: "The number of jobs to spawn in parallel during the build process"),
-            to: { $0.jobs = UInt32($1) })
-
-        binder.bind(
-            option: parser.add(option: "--enable-test-discovery", kind: Bool.self,
-               usage: "Enable test discovery on platforms without Objective-C runtime"),
-            to: { $0.enableTestDiscovery = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--enable-build-manifest-caching", kind: Bool.self, usage: nil),
-            to: { $0.enableBuildManifestCaching = $1 })
-
-        binder.bind(
-            option: parser.add(option: "--emit-swift-module-separately", kind: Bool.self, usage: nil),
-            to: { $0.emitSwiftModuleSeparately = $1 })
-
-        // Let subclasses bind arguments.
-        type(of: self).defineArguments(parser: parser, binder: binder)
-
         do {
-            // Parse the result.
-            let result = try parser.parse(args)
-
-            try Self.postprocessArgParserResult(result: result, diagnostics: diagnostics)
-
-            var options = Options()
-            try binder.fill(parseResult: result, into: &options)
-
+            try Self.postprocessArgParserResult(options: options, diagnostics: diagnostics)
             self.options = options
+            
             // Honor package-path option is provided.
             if let packagePath = options.packagePath ?? options.chdir {
                 try ProcessEnv.chdir(packagePath)
             }
+
+            // Force building with the native build system on other platforms than macOS.
+          #if !os(macOS)
+            self.options._buildSystem = .native
+          #endif
 
             let processSet = ProcessSet()
             let buildSystemRef = BuildSystemRef()
             interruptHandler = try InterruptHandler {
                 // Terminate all processes on receiving an interrupt signal.
                 processSet.terminate()
-                buildSystemRef.buildOp?.cancel()
+                buildSystemRef.buildSystem?.cancel()
 
               #if os(Windows)
                 // Exit as if by signal()
@@ -394,7 +337,7 @@ public class SwiftTool<Options: ToolOptions> {
 
         } catch {
             handle(error: error)
-            SwiftTool.exit(with: .failure)
+            throw ExitCode.failure
         }
 
         // Create local variables to use while finding build path to avoid capture self before init error.
@@ -405,20 +348,41 @@ public class SwiftTool<Options: ToolOptions> {
         self.buildPath = getEnvBuildPath(workingDir: cwd) ??
             customBuildPath ??
             (packageRoot ?? cwd).appending(component: ".build")
+        
+        // Setup the globals.
+        verbosity = Verbosity(rawValue: options.verbosity)
+        Process.verbose = verbosity != .concise
     }
-
-    static func postprocessArgParserResult(result: ArgumentParser.Result, diagnostics: DiagnosticsEngine) throws {
-        if result.exists(arg: "--chdir") || result.exists(arg: "-C") {
+    
+    static func postprocessArgParserResult(options: SwiftToolOptions, diagnostics: DiagnosticsEngine) throws {
+        if options.chdir != nil {
             diagnostics.emit(warning: "'--chdir/-C' option is deprecated; use '--package-path' instead")
         }
-
-        if result.exists(arg: "--multiroot-data-file") {
+        
+        if options.multirootPackageDataFile != nil {
             diagnostics.emit(.unsupportedFlag("--multiroot-data-file"))
         }
-    }
-
-    class func defineArguments(parser: ArgumentParser, binder: ArgumentBinder<Options>) {
-        fatalError("Must be implemented by subclasses")
+        
+        if options.useExplicitModuleBuild && !options.useIntegratedSwiftDriver {
+            diagnostics.emit(error: "'--experimental-explicit-module-build' option requires '--use-integrated-swift-driver'")
+        }
+        
+        if !options.archs.isEmpty && options.customCompileTriple != nil {
+            diagnostics.emit(.mutuallyExclusiveArgumentsError(arguments: ["--arch", "--triple"]))
+        }
+        
+        if options.netrcFilePath != nil {
+            // --netrc-file option only supported on macOS >=10.13
+            #if os(macOS)
+            if #available(macOS 10.13, *) {
+                // ok, check succeeds
+            } else {
+                diagnostics.emit(error: "'--netrc-file' option is only supported on macOS >=10.13")
+            }
+            #else
+            diagnostics.emit(error: "'--netrc-file' option is only supported on macOS >=10.13")
+            #endif
+        }
     }
 
     func editablesPath() throws -> AbsolutePath {
@@ -451,9 +415,13 @@ public class SwiftTool<Options: ToolOptions> {
     func getSwiftPMConfig() throws -> SwiftPMConfig {
         return try _swiftpmConfig.get()
     }
-    private lazy var _swiftpmConfig: Result<SwiftPMConfig, AnyError> = {
-        return Result(anyError: { SwiftPMConfig(path: try configFilePath()) })
+    private lazy var _swiftpmConfig: Result<SwiftPMConfig, Swift.Error> = {
+        return Result(catching: { SwiftPMConfig(path: try configFilePath()) })
     }()
+    
+    func resolvedNetrcFilePath() -> AbsolutePath? {
+        return options.netrcFilePath 
+    }
 
     /// Holds the currently active workspace.
     ///
@@ -467,7 +435,8 @@ public class SwiftTool<Options: ToolOptions> {
         if let workspace = _workspace {
             return workspace
         }
-        let delegate = ToolWorkspaceDelegate(self.stdoutStream)
+        let isVerbose = options.verbosity != 0
+        let delegate = ToolWorkspaceDelegate(self.stdoutStream, isVerbose: isVerbose, diagnostics: diagnostics)
         let provider = GitRepositoryProvider(processSet: processSet)
         let workspace = Workspace(
             dataPath: buildPath,
@@ -478,45 +447,13 @@ public class SwiftTool<Options: ToolOptions> {
             delegate: delegate,
             config: try getSwiftPMConfig(),
             repositoryProvider: provider,
+            netrcFilePath: resolvedNetrcFilePath(),
             isResolverPrefetchingEnabled: options.shouldEnableResolverPrefetching,
-            enablePubgrubResolver: options.enablePubgrubResolver,
             skipUpdate: options.skipDependencyUpdate,
             enableResolverTrace: options.enableResolverTrace
         )
         _workspace = workspace
         return workspace
-    }
-
-    /// Execute the tool.
-    public func run() {
-        do {
-            // Setup the globals.
-            verbosity = Verbosity(rawValue: options.verbosity)
-            Process.verbose = verbosity != .concise
-            // Call the implementation.
-            try runImpl()
-            if diagnostics.hasErrors {
-                throw Diagnostics.fatalError
-            }
-        } catch {
-            // Set execution status to failure in case of errors.
-            executionStatus = .failure
-            handle(error: error)
-        }
-        SwiftTool.exit(with: executionStatus)
-    }
-
-    /// Exit the tool with the given execution status.
-    private static func exit(with status: ExecutionStatus) -> Never {
-        switch status {
-        case .success: TSCLibc.exit(0)
-        case .failure: TSCLibc.exit(1)
-        }
-    }
-
-    /// Run method implementation to be overridden by subclasses.
-    func runImpl() throws {
-        fatalError("Must be implemented by subclasses")
     }
 
     /// Start redirecting the standard output stream to the standard error stream.
@@ -539,13 +476,18 @@ public class SwiftTool<Options: ToolOptions> {
         // Throw if there were errors when loading the graph.
         // The actual errors will be printed before exiting.
         guard !diagnostics.hasErrors else {
-            throw Diagnostics.fatalError
+            throw ExitCode.failure
         }
     }
 
     /// Fetch and load the complete package graph.
+    ///
+    /// - Parameters:
+    ///   - explicitProduct: The product specified on the command line to a “swift run” or “swift build” command. This allows executables from dependencies to be run directly without having to hook them up to any particular target.
     @discardableResult
     func loadPackageGraph(
+        explicitProduct: String? = nil,
+        createMultipleTestProducts: Bool = false,
         createREPLProduct: Bool = false
     ) throws -> PackageGraph {
         do {
@@ -554,6 +496,8 @@ public class SwiftTool<Options: ToolOptions> {
             // Fetch and load the package graph.
             let graph = try workspace.loadPackageGraph(
                 root: getWorkspaceRoot(),
+                explicitProduct: explicitProduct,
+                createMultipleTestProducts: createMultipleTestProducts,
                 createREPLProduct: createREPLProduct,
                 forceResolvedVersions: options.forceResolvedVersions,
                 diagnostics: diagnostics
@@ -562,7 +506,7 @@ public class SwiftTool<Options: ToolOptions> {
             // Throw if there were errors when loading the graph.
             // The actual errors will be printed before exiting.
             guard !diagnostics.hasErrors else {
-                throw Diagnostics.fatalError
+                throw ExitCode.failure
             }
             return graph
         } catch {
@@ -588,82 +532,149 @@ public class SwiftTool<Options: ToolOptions> {
         // Perform steps for build manifest caching if we can enabled it.
         //
         // FIXME: We don't add edited packages in the package structure command yet (SR-11254).
-        let hasEditedPackages = try getActiveWorkspace().managedDependencies.values.contains{ $0.isEdited }
+        let hasEditedPackages = try getActiveWorkspace().state.dependencies.contains(where: { $0.isEdited })
 
-        return options.enableBuildManifestCaching && haveBuildManifestAndDescription && !hasEditedPackages
+        let enableBuildManifestCaching = ProcessEnv.vars.keys.contains("SWIFTPM_ENABLE_BUILD_MANIFEST_CACHING") || options.enableBuildManifestCaching
+
+        return enableBuildManifestCaching && haveBuildManifestAndDescription && !hasEditedPackages
     }
 
-    func createBuildOperation(useBuildManifestCaching: Bool = true) throws -> BuildOperation {
+    func createBuildOperation(explicitProduct: String? = nil, useBuildManifestCaching: Bool = true) throws -> BuildOperation {
         // Load a custom package graph which has a special product for REPL.
-        let graphLoader = { try self.loadPackageGraph() }
+        let graphLoader = { try self.loadPackageGraph(explicitProduct: explicitProduct) }
 
         // Construct the build operation.
         let buildOp = try BuildOperation(
             buildParameters: buildParameters(),
             useBuildManifestCaching: useBuildManifestCaching && canUseBuildManifestCaching(),
             packageGraphLoader: graphLoader,
-            diags: diagnostics,
+            diagnostics: diagnostics,
             stdoutStream: self.stdoutStream
         )
 
         // Save the instance so it can be cancelled from the int handler.
-        buildSystemRef.buildOp = buildOp
+        buildSystemRef.buildSystem = buildOp
         return buildOp
+    }
+
+    func createBuildSystem(explicitProduct: String? = nil, useBuildManifestCaching: Bool = true) throws -> BuildSystem {
+        let buildSystem: BuildSystem
+        switch options.buildSystem {
+        case .native:
+            let graphLoader = { try self.loadPackageGraph(explicitProduct: explicitProduct) }
+            buildSystem = try BuildOperation(
+                buildParameters: buildParameters(),
+                useBuildManifestCaching: useBuildManifestCaching && canUseBuildManifestCaching(),
+                packageGraphLoader: graphLoader,
+                diagnostics: diagnostics,
+                stdoutStream: stdoutStream
+            )
+        case .xcode:
+            let graphLoader = { try self.loadPackageGraph(explicitProduct: explicitProduct, createMultipleTestProducts: true) }
+            buildSystem = try XcodeBuildSystem(
+                buildParameters: buildParameters(),
+                packageGraphLoader: graphLoader,
+                isVerbose: verbosity != .concise,
+                diagnostics: diagnostics,
+                stdoutStream: stdoutStream
+            )
+        }
+
+        // Save the instance so it can be cancelled from the int handler.
+        buildSystemRef.buildSystem = buildSystem
+        return buildSystem
     }
 
     /// Return the build parameters.
     func buildParameters() throws -> BuildParameters {
         return try _buildParameters.get()
     }
-    private lazy var _buildParameters: Result<BuildParameters, AnyError> = {
-        return Result(anyError: {
+    private lazy var _buildParameters: Result<BuildParameters, Swift.Error> = {
+        return Result(catching: {
             let toolchain = try self.getToolchain()
-            let triple = toolchain.destination.target
+            let triple = toolchain.triple
 
+            // Use "apple" as the subdirectory because in theory Xcode build system
+            // can be used to build for any Apple platform and it has it's own
+            // conventions for build subpaths based on platforms.
+            let dataPath = buildPath.appending(
+                 component: options.buildSystem == .xcode ? "apple" : triple.tripleString)
             return BuildParameters(
-                dataPath: buildPath.appending(component: toolchain.destination.target.tripleString),
+                dataPath: dataPath,
                 configuration: options.configuration,
                 toolchain: toolchain,
                 destinationTriple: triple,
+                archs: options.archs,
                 flags: options.buildFlags,
+                xcbuildFlags: options.xcbuildFlags,
+                jobs: options.jobs ?? UInt32(ProcessInfo.processInfo.activeProcessorCount),
                 shouldLinkStaticSwiftStdlib: options.shouldLinkStaticSwiftStdlib,
-                sanitizers: options.sanitizers,
+                sanitizers: options.enabledSanitizers,
                 enableCodeCoverage: options.shouldEnableCodeCoverage,
-                indexStoreMode: options.indexStoreMode,
+                indexStoreMode: options.indexStore,
                 enableParseableModuleInterfaces: options.shouldEnableParseableModuleInterfaces,
                 enableTestDiscovery: options.enableTestDiscovery,
-                emitSwiftModuleSeparately: options.emitSwiftModuleSeparately
+                emitSwiftModuleSeparately: options.emitSwiftModuleSeparately,
+                useIntegratedSwiftDriver: options.useIntegratedSwiftDriver,
+                useExplicitModuleBuild: options.useExplicitModuleBuild,
+                isXcodeBuildSystemEnabled: options.buildSystem == .xcode,
+                printManifestGraphviz: options.printManifestGraphviz
             )
         })
     }()
 
     /// Lazily compute the destination toolchain.
-    private lazy var _destinationToolchain: Result<UserToolchain, AnyError> = {
-        // Create custom toolchain if present.
-        if let customDestination = self.options.customCompileDestination {
-            return Result(anyError: {
-                try UserToolchain(destination: Destination(fromFile: customDestination))
-            })
+    private lazy var _destinationToolchain: Result<UserToolchain, Swift.Error> = {
+        var destination: Destination
+        let hostDestination: Destination
+        do {
+            hostDestination = try self._hostToolchain.get().destination
+            // Create custom toolchain if present.
+            if let customDestination = self.options.customCompileDestination {
+                destination = try Destination(fromFile: customDestination)
+            } else {
+                // Otherwise use the host toolchain.
+                destination = hostDestination
+            }
+        } catch {
+            return .failure(error)
         }
-        // Otherwise use the host toolchain.
-        return self._hostToolchain
+        // Apply any manual overrides.
+        if let triple = self.options.customCompileTriple {
+            destination.target = triple
+        }
+        if let binDir = self.options.customCompileToolchain {
+            destination.binDir = binDir.appending(components: "usr", "bin")
+        }
+        if let sdk = self.options.customCompileSDK {
+            destination.sdk = sdk
+        }
+        destination.archs = options.archs
+
+        // Check if we ended up with the host toolchain.
+        if hostDestination == destination {
+            return self._hostToolchain
+        }
+
+        return Result(catching: { try UserToolchain(destination: destination) })
     }()
 
     /// Lazily compute the host toolchain used to compile the package description.
-    private lazy var _hostToolchain: Result<UserToolchain, AnyError> = {
-        return Result(anyError: {
+    private lazy var _hostToolchain: Result<UserToolchain, Swift.Error> = {
+        return Result(catching: {
             try UserToolchain(destination: Destination.hostDestination(
                         originalWorkingDirectory: self.originalWorkingDirectory))
         })
     }()
 
-    private lazy var _manifestLoader: Result<ManifestLoader, AnyError> = {
-        return Result(anyError: {
+    private lazy var _manifestLoader: Result<ManifestLoader, Swift.Error> = {
+        return Result(catching: {
             try ManifestLoader(
                 // Always use the host toolchain's resources for parsing manifest.
                 manifestResources: self._hostToolchain.get().manifestResources,
                 isManifestSandboxEnabled: !self.options.shouldDisableSandbox,
-                cacheDir: self.options.shouldDisableManifestCaching ? nil : self.buildPath
+                cacheDir: self.options.shouldDisableManifestCaching ? nil : self.buildPath,
+                extraManifestFlags: self.options.manifestFlags
             )
         })
     }()
@@ -732,17 +743,10 @@ private func sandboxProfile(allowedDirectories: [AbsolutePath]) -> String {
     return stream.bytes.description
 }
 
-extension BuildConfiguration: StringEnumArgument {
-    public static var completion: ShellCompletion = .values([
-        (debug.rawValue, "build with DEBUG configuration"),
-        (release.rawValue, "build with RELEASE configuration"),
-    ])
-}
-
 /// A wrapper to hold the build system so we can use it inside
 /// the int. handler without requiring to initialize it.
 final class BuildSystemRef {
-    var buildOp: BuildOperation?
+    var buildSystem: BuildSystem?
 }
 
 extension Diagnostic.Message {

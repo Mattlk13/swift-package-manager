@@ -30,7 +30,7 @@ class MiscellaneousTestCase: XCTestCase {
         // the selected version of the package
 
         fixture(name: "DependencyResolution/External/Simple") { prefix in
-            let output = try executeSwiftBuild(prefix.appending(component: "Bar"))
+            let (output, _) = try executeSwiftBuild(prefix.appending(component: "Bar"))
             XCTAssertMatch(output, .regex("Resolving .* at 1\\.2\\.3"))
             XCTAssertMatch(output, .contains("Compiling Foo Foo.swift"))
             XCTAssertMatch(output, .contains("Merging module Foo"))
@@ -47,7 +47,7 @@ class MiscellaneousTestCase: XCTestCase {
 
         fixture(name: "Miscellaneous/ExactDependencies") { prefix in
             XCTAssertBuilds(prefix.appending(component: "app"))
-            let buildDir = prefix.appending(components: "app", ".build", Destination.host.target.tripleString, "debug")
+            let buildDir = prefix.appending(components: "app", ".build", Resources.default.toolchain.triple.tripleString, "debug")
             XCTAssertFileExists(buildDir.appending(component: "FooExec"))
             XCTAssertFileExists(buildDir.appending(component: "FooLib1.swiftmodule"))
             XCTAssertFileExists(buildDir.appending(component: "FooLib2.swiftmodule"))
@@ -120,7 +120,7 @@ class MiscellaneousTestCase: XCTestCase {
     */
     func testInternalDependencyEdges() {
         fixture(name: "Miscellaneous/DependencyEdges/Internal") { prefix in
-            let execpath = prefix.appending(components: ".build", Destination.host.target.tripleString, "debug", "Foo").pathString
+            let execpath = prefix.appending(components: ".build", Resources.default.toolchain.triple.tripleString, "debug", "Foo").pathString
 
             XCTAssertBuilds(prefix)
             var output = try Process.checkNonZeroExit(args: execpath)
@@ -144,7 +144,7 @@ class MiscellaneousTestCase: XCTestCase {
     */
     func testExternalDependencyEdges1() {
         fixture(name: "DependencyResolution/External/Complex") { prefix in
-            let execpath = prefix.appending(components: "app", ".build", Destination.host.target.tripleString, "debug", "Dealer").pathString
+            let execpath = prefix.appending(components: "app", ".build", Resources.default.toolchain.triple.tripleString, "debug", "Dealer").pathString
 
             let packageRoot = prefix.appending(component: "app")
             XCTAssertBuilds(packageRoot)
@@ -171,7 +171,7 @@ class MiscellaneousTestCase: XCTestCase {
      */
     func testExternalDependencyEdges2() {
         fixture(name: "Miscellaneous/DependencyEdges/External") { prefix in
-            let execpath = [prefix.appending(components: "root", ".build", Destination.host.target.tripleString, "debug", "dep2").pathString]
+            let execpath = [prefix.appending(components: "root", ".build", Resources.default.toolchain.triple.tripleString, "debug", "dep2").pathString]
 
             let packageRoot = prefix.appending(component: "root")
             XCTAssertBuilds(prefix.appending(component: "root"))
@@ -195,7 +195,7 @@ class MiscellaneousTestCase: XCTestCase {
     func testSpaces() {
         fixture(name: "Miscellaneous/Spaces Fixture") { prefix in
             XCTAssertBuilds(prefix)
-            XCTAssertFileExists(prefix.appending(components: ".build", Destination.host.target.tripleString, "debug", "Module_Name_1.build", "Foo.swift.o"))
+            XCTAssertFileExists(prefix.appending(components: ".build", Resources.default.toolchain.triple.tripleString, "debug", "Module_Name_1.build", "Foo.swift.o"))
         }
     }
 
@@ -213,19 +213,21 @@ class MiscellaneousTestCase: XCTestCase {
     }
 
     func testSwiftTestParallel() throws {
-        // Running swift-test fixtures on linux is not yet possible.
-      #if os(macOS)
         fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
           // First try normal serial testing.
           do {
-            _ = try SwiftPMProduct.SwiftTest.execute([], packagePath: prefix)
-          } catch SwiftPMProductError.executionFailure(_, _, let stderr) {
-            XCTAssertTrue(stderr.contains("Executed 2 tests"))
+            _ = try SwiftPMProduct.SwiftTest.execute(["--enable-test-discovery"], packagePath: prefix)
+          } catch SwiftPMProductError.executionFailure(_, let output, let stderr) {
+            #if os(macOS)
+              XCTAssertTrue(stderr.contains("Executed 2 tests"))
+            #else
+              XCTAssertTrue(output.contains("Executed 2 tests"))
+            #endif
           }
 
           do {
             // Run tests in parallel.
-            _ = try SwiftPMProduct.SwiftTest.execute(["--parallel"], packagePath: prefix)
+            _ = try SwiftPMProduct.SwiftTest.execute(["--parallel", "--enable-test-discovery"], packagePath: prefix)
           } catch SwiftPMProductError.executionFailure(_, let output, _) {
             XCTAssert(output.contains("testExample1"))
             XCTAssert(output.contains("testExample2"))
@@ -238,7 +240,7 @@ class MiscellaneousTestCase: XCTestCase {
           do {
             // Run tests in parallel with verbose output.
             _ = try SwiftPMProduct.SwiftTest.execute(
-                ["--parallel", "--verbose", "--xunit-output", xUnitOutput.pathString],
+                ["--parallel", "--verbose", "--xunit-output", xUnitOutput.pathString, "--enable-test-discovery"],
                 packagePath: prefix)
           } catch SwiftPMProductError.executionFailure(_, let output, _) {
             XCTAssert(output.contains("testExample1"))
@@ -253,16 +255,46 @@ class MiscellaneousTestCase: XCTestCase {
           let contents = try localFileSystem.readFileContents(xUnitOutput).description
           XCTAssertTrue(contents.contains("tests=\"3\" failures=\"1\""))
         }
-      #endif
     }
 
     func testSwiftTestFilter() throws {
-        #if os(macOS)
-            fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
-                let output = try SwiftPMProduct.SwiftTest.execute(["--filter", ".*1"], packagePath: prefix)
-                XCTAssert(output.contains("testExample1"))
-            }
-        #endif
+        fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
+            let (stdout, _) = try SwiftPMProduct.SwiftTest.execute(["--filter", ".*1", "-l", "--enable-test-discovery"], packagePath: prefix)
+            XCTAssertMatch(stdout, .contains("testExample1"))
+            XCTAssertNoMatch(stdout, .contains("testExample2"))
+            XCTAssertNoMatch(stdout, .contains("testSureFailure"))
+        }
+
+        fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
+            let (stdout, _) = try SwiftPMProduct.SwiftTest.execute(["--filter", "ParallelTestsTests", "--skip", ".*1", "--filter", "testSureFailure", "-l", "--enable-test-discovery"], packagePath: prefix)
+            XCTAssertNoMatch(stdout, .contains("testExample1"))
+            XCTAssertMatch(stdout, .contains("testExample2"))
+            XCTAssertMatch(stdout, .contains("testSureFailure"))
+        }
+    }
+
+    func testSwiftTestSkip() throws {
+        fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
+            let (stdout, _) = try SwiftPMProduct.SwiftTest.execute(["--skip", "ParallelTestsTests", "-l", "--enable-test-discovery"], packagePath: prefix)
+            XCTAssertNoMatch(stdout, .contains("testExample1"))
+            XCTAssertNoMatch(stdout, .contains("testExample2"))
+            XCTAssertMatch(stdout, .contains("testSureFailure"))
+        }
+
+        fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
+            let (stdout, _) = try SwiftPMProduct.SwiftTest.execute(["--filter", "ParallelTestsTests", "--skip", ".*2", "--filter", "TestsFailure", "--skip", "testSureFailure", "-l", "--enable-test-discovery"], packagePath: prefix)
+            XCTAssertMatch(stdout, .contains("testExample1"))
+            XCTAssertNoMatch(stdout, .contains("testExample2"))
+            XCTAssertNoMatch(stdout, .contains("testSureFailure"))
+        }
+
+        fixture(name: "Miscellaneous/ParallelTestsPkg") { prefix in
+            let (stdout, stderr) = try SwiftPMProduct.SwiftTest.execute(["--skip", "Tests", "--enable-test-discovery"], packagePath: prefix)
+            XCTAssertNoMatch(stdout, .contains("testExample1"))
+            XCTAssertNoMatch(stdout, .contains("testExample2"))
+            XCTAssertNoMatch(stdout, .contains("testSureFailure"))
+            XCTAssertMatch(stderr, .contains("No matching test cases were run"))
+        }
     }
 
     func testOverridingSwiftcArguments() throws {
@@ -278,7 +310,8 @@ class MiscellaneousTestCase: XCTestCase {
             let systemModule = prefix.appending(component: "SystemModule")
             // Create a shared library.
             let input = systemModule.appending(components: "Sources", "SystemModule.c")
-            let output =  systemModule.appending(component: "libSystemModule\(Destination.host.target.dynamicLibraryExtension)")
+            let triple = Resources.default.toolchain.triple
+            let output =  systemModule.appending(component: "libSystemModule\(triple.dynamicLibraryExtension)")
             try systemQuietly(["clang", "-shared", input.pathString, "-o", output.pathString])
 
             let pcFile = prefix.appending(component: "libSystemModule.pc")
@@ -303,7 +336,7 @@ class MiscellaneousTestCase: XCTestCase {
             let env = ["PKG_CONFIG_PATH": prefix.pathString]
             _ = try executeSwiftBuild(moduleUser, env: env)
 
-            XCTAssertFileExists(moduleUser.appending(components: ".build", Destination.host.target.tripleString, "debug", "SystemModuleUserClang"))
+            XCTAssertFileExists(moduleUser.appending(components: ".build", triple.tripleString, "debug", "SystemModuleUserClang"))
         }
     }
 
@@ -475,6 +508,9 @@ class MiscellaneousTestCase: XCTestCase {
     }
 
     func testTrivialSwiftAPIDiff() throws {
+        // FIXME: Looks like this test isn't really working at all.
+        guard Resources.havePD4Runtime else { return }
+
         if (try? Resources.default.toolchain.getSwiftAPIDigester()) == nil {
             print("unable to find swift-api-digester, skipping \(#function)")
             return
@@ -507,7 +543,7 @@ class MiscellaneousTestCase: XCTestCase {
                 """
             }
 
-            let diff = try SwiftPMProduct.SwiftPackage.execute(["experimental-api-diff", "1.0.0"], packagePath: package)
+            let (diff, _) = try SwiftPMProduct.SwiftPackage.execute(["experimental-api-diff", "1.0.0"], packagePath: package)
             XCTAssertMatch(diff, .contains("Func Foo.foo() has been renamed to Func foo(param:)"))
             XCTAssertMatch(diff, .contains("Func Foo.foo() has return type change from Swift.String to Swift.Int"))
         }

@@ -10,6 +10,7 @@
 
 import TSCBasic
 import TSCUtility
+import Foundation
 
 /// This contains the declarative specification loaded from package manifest
 /// files, and the tools for working with the manifest.
@@ -36,11 +37,20 @@ public final class Manifest: ObjectIdentifierProtocol, CustomStringConvertible, 
     /// The version this package was loaded from, if known.
     public let version: Version?
 
+    /// The revision this package was loaded from, if known.
+    public let revision: String?
+
     /// The tools version declared in the manifest.
     public let toolsVersion: ToolsVersion
 
     /// The name of the package.
     public let name: String
+
+    /// The default localization for resources.
+    public let defaultLocalization: String?
+
+    /// Whether kind of package this manifest is from.
+    public let packageKind: PackageReference.Kind
 
     /// The declared platforms in the manifest.
     public let platforms: [PlatformDescription]
@@ -50,6 +60,9 @@ public final class Manifest: ObjectIdentifierProtocol, CustomStringConvertible, 
 
     /// The targets declared in the manifest.
     public let targets: [TargetDescription]
+
+    /// The targets declared in the manifest, keyed by their name.
+    public let targetMap: [String: TargetDescription]
 
     /// The products declared in the manifest.
     public let products: [ProductDescription]
@@ -69,13 +82,22 @@ public final class Manifest: ObjectIdentifierProtocol, CustomStringConvertible, 
     /// The system package providers of a system package.
     public let providers: [SystemPackageProviderDescription]?
 
+    /// Targets required for building particular product filters.
+    private var _requiredTargets: [ProductFilter: [TargetDescription]]
+
+    /// Dependencies required for building particular product filters.
+    private var _requiredDependencies: [ProductFilter: [FilteredDependencyDescription]]
+
     public init(
         name: String,
+        defaultLocalization: String? = nil,
         platforms: [PlatformDescription],
         path: AbsolutePath,
         url: String,
         version: TSCUtility.Version? = nil,
+        revision: String? = nil,
         toolsVersion: ToolsVersion,
+        packageKind: PackageReference.Kind,
         pkgConfig: String? = nil,
         providers: [SystemPackageProviderDescription]? = nil,
         cLanguageStandard: String? = nil,
@@ -86,11 +108,14 @@ public final class Manifest: ObjectIdentifierProtocol, CustomStringConvertible, 
         targets: [TargetDescription] = []
     ) {
         self.name = name
+        self.defaultLocalization = defaultLocalization
         self.platforms = platforms
         self.path = path
         self.url = url
         self.version = version
+        self.revision = revision
         self.toolsVersion = toolsVersion
+        self.packageKind = packageKind
         self.pkgConfig = pkgConfig
         self.providers = providers
         self.cLanguageStandard = cLanguageStandard
@@ -99,6 +124,9 @@ public final class Manifest: ObjectIdentifierProtocol, CustomStringConvertible, 
         self.dependencies = dependencies
         self.products = products
         self.targets = targets
+        self.targetMap = Dictionary(targets.lazy.map({ ($0.name, $0) }), uniquingKeysWith: { $1 })
+        self._requiredTargets = [:]
+        self._requiredDependencies = [:]
     }
 
     public var description: String {
@@ -140,6 +168,39 @@ extension ToolsVersion {
 }
 
 extension Manifest {
+    /// Returns the targets required for a particular product filter.
+    public func targetsRequired(for productFilter: ProductFilter) -> [TargetDescription] {
+        // If we have already calcualted it, returned the cached value.
+        if let targets = _requiredTargets[productFilter] {
+            return targets
+        } else {
+            let targets: [TargetDescription]
+            switch productFilter {
+            case .everything:
+                return self.targets
+            case .specific(let productFilter):
+                let products = self.products.filter { productFilter.contains($0.name) }
+                targets = targetsRequired(for: products)
+            }
+
+            _requiredTargets[productFilter] = targets
+            return targets
+        }
+    }
+
+    /// Returns the package dependencies required for a particular products filter.
+    public func dependenciesRequired(for productFilter: ProductFilter) -> [FilteredDependencyDescription] {
+        // If we have already calcualted it, returned the cached value.
+        if let dependencies = _requiredDependencies[productFilter] {
+            return dependencies
+        } else {
+            let targets = targetsRequired(for: productFilter)
+            let dependencies = dependenciesRequired(for: targets, keepUnused: productFilter == .everything)
+            _requiredDependencies[productFilter] = dependencies
+            return dependencies
+        }
+    }
+
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(name, forKey: .name)
@@ -150,6 +211,7 @@ extension Manifest {
             try container.encode(path, forKey: .path)
             try container.encode(url, forKey: .url)
             try container.encode(version, forKey: .version)
+            try container.encode(targetMap, forKey: .targetMap)
         }
 
         try container.encode(toolsVersion, forKey: .toolsVersion)
@@ -162,6 +224,173 @@ extension Manifest {
         try container.encode(products, forKey: .products)
         try container.encode(targets, forKey: .targets)
         try container.encode(platforms, forKey: .platforms)
+        try container.encode(packageKind, forKey: .packageKind)
+    }
+
+    /// Returns the targets required for building the provided products.
+    public func targetsRequired(for products: [ProductDescription]) -> [TargetDescription] {
+        let targetsByName = Dictionary(targets.map({ ($0.name, $0) }), uniquingKeysWith: { $1 })
+        let productTargetNames = products.flatMap({ $0.targets })
+
+        let dependentTargetNames = transitiveClosure(productTargetNames, successors: { targetName in
+            targetsByName[targetName]?.dependencies.compactMap({ dependency in
+                switch dependency {
+                case .target(let name, _),
+                     .byName(let name, _):
+                    return targetsByName.keys.contains(name) ? name : nil
+                default:
+                    return nil
+                }
+            }) ?? []
+        })
+
+        let requiredTargetNames = Set(productTargetNames).union(dependentTargetNames)
+        let requiredTargets = requiredTargetNames.compactMap({ targetsByName[$0] })
+        return requiredTargets
+    }
+
+    /// Returns the package dependencies required for building the provided targets.
+    ///
+    /// The returned dependencies have their particular product filters registered. (To determine product filters without removing any dependencies from the list, specify `keepUnused: true`.)
+    public func dependenciesRequired(
+        for targets: [TargetDescription],
+        keepUnused: Bool = false
+    ) -> [FilteredDependencyDescription] {
+
+        var registry: (known: [String: ProductFilter], unknown: Set<String>) = ([:], [])
+        let availablePackages = Set(dependencies.lazy.map({ $0.name }))
+
+        for target in targets {
+            for targetDependency in target.dependencies {
+                register(targetDependency: targetDependency, registry: &registry, availablePackages: availablePackages)
+            }
+        }
+
+        // Products whose package could not be determined are marked as needed on every dependency.
+        // (This way none of them filters such a product out.)
+        var associations = registry.known
+        let unknown = registry.unknown
+        if !registry.unknown.isEmpty {
+            for package in availablePackages {
+                associations[package, default: .specific([])].formUnion(.specific(unknown))
+            }
+        }
+
+        return dependencies.compactMap { dependency in
+            if let filter = associations[dependency.name] {
+                return FilteredDependencyDescription(declaration: dependency, productFilter: filter)
+            } else if keepUnused {
+                // Register that while the dependency was kept, no products are needed.
+                return FilteredDependencyDescription(declaration: dependency, productFilter: .specific([]))
+            } else {
+                // Dependencies known to not have any relevant products are discarded.
+                return nil
+            }
+        }
+    }
+
+    /// Finds the package dependency referenced by the specified target dependency.
+    /// - Returns: Returns `nil` if the dependency is a target dependency, if it is a product dependency but has no
+    /// package name (for tools versions less than 5.2), or if there were no dependencies with the provided name.
+    public func packageDependency(
+        referencedBy targetDependency: TargetDescription.Dependency
+    ) -> PackageDependencyDescription? {
+        let packageName: String
+
+        switch targetDependency {
+        case .product(_, package: let name?, _),
+             .byName(name: let name, _):
+            packageName = name
+        default:
+            return nil
+        }
+
+        return dependencies.first(where: { $0.name == packageName })
+    }
+
+    /// Registers a required product with a particular dependency if possible, or registers it as unknown.
+    ///
+    /// - Parameters:
+    ///   - targetDependency: The target dependency to register.
+    ///   - registry: The registry in which to record the assocation.
+    ///   - availablePackages: The set of available packages.
+    private func register(
+        targetDependency: TargetDescription.Dependency,
+        registry: inout (known: [String: ProductFilter], unknown: Set<String>),
+        availablePackages: Set<String>
+    ) {
+        switch targetDependency {
+        case .target:
+            break
+        case .product(let product, let package, _):
+            if let package = package { // ≥ 5.2
+                if !register(
+                    product: product,
+                    inPackage: package,
+                    registry: &registry.known,
+                    availablePackages: availablePackages) {
+                        // This is an invalid manifest condition diagnosed later. (No such package.)
+                        // Treating it as unknown gracefully allows resolution to continue for now.
+                    registry.unknown.insert(product)
+                }
+            } else { // < 5.2
+                registry.unknown.insert(product)
+            }
+        case .byName(let product, _):
+            if toolsVersion < .v5_2 {
+                // A by‐name entry might be a product from anywhere.
+                if targets.contains(where: { $0.name == product }) {
+                    // Save the resolver some effort if it is known to only be a target anyway.
+                    break
+                } else {
+                    registry.unknown.insert(product)
+                }
+            } else { // ≥ 5.2
+                // If a by‐name entry is a product, it must be in a package of the same name.
+                if !register(
+                    product: product,
+                    inPackage: product,
+                    registry: &registry.known,
+                    availablePackages: availablePackages) {
+                        // If it doesn’t match a package, it should be a target, not a product.
+                        if targets.contains(where: { $0.name == product }) {
+                            break
+                        } else {
+                            // But in case the user is trying to reference a product,
+                            // we still need to pass on the invalid reference
+                            // so that the resolver fetches all dependencies
+                            // in order to provide the diagnostic pass with the information it needs.
+                            registry.unknown.insert(product)
+                        }
+                }
+            }
+        }
+    }
+
+    /// Registers a required product with a particular dependency if possible.
+    ///
+    /// - Parameters:
+    ///   - product: The product to try registering.
+    ///   - package: The package to try associating it with.
+    ///   - registry: The registry in which to record the assocation.
+    ///   - availablePackages: The set of available packages.
+    ///
+    /// - Returns: `true` if the particular dependency was found and the product was registered; `false` if no matching dependency was found and the product has not yet been handled.
+    private func register(
+        product: String,
+        inPackage package: String,
+        registry: inout [String: ProductFilter],
+        availablePackages: Set<String>
+    ) -> Bool {
+        if let existing = registry[package] {
+            registry[package] = existing.union(.specific([product]))
+            return true
+        } else if availablePackages.contains(package) {
+            registry[package] = .specific([product])
+            return true
+        } else {
+            return false
+        }
     }
 }
 
@@ -173,20 +402,25 @@ public struct TargetDescription: Equatable, Codable {
         case regular
         case test
         case system
+        case binary
     }
 
     /// Represents a target's dependency on another entity.
     public enum Dependency: Equatable, ExpressibleByStringLiteral {
-        case target(name: String)
-        case product(name: String, package: String?)
-        case byName(name: String)
+        case target(name: String, condition: PackageConditionDescription?)
+        case product(name: String, package: String?, condition: PackageConditionDescription?)
+        case byName(name: String, condition: PackageConditionDescription?)
 
         public init(stringLiteral value: String) {
-            self = .byName(name: value)
+            self = .byName(name: value, condition: nil)
         }
 
-        public static func product(name: String) -> Dependency {
-            return .product(name: name, package: nil)
+        public static func target(name: String) -> Dependency {
+            return .target(name: name, condition: nil)
+        }
+
+        public static func product(name: String, package: String? = nil) -> Dependency {
+            return .product(name: name, package: package, condition: nil)
         }
     }
 
@@ -196,15 +430,25 @@ public struct TargetDescription: Equatable, Codable {
             case copy
         }
 
+        public enum Localization: String, Codable, Equatable {
+            case `default`
+            case base
+        }
+
         /// The rule for the resource.
         public let rule: Rule
 
         /// The path of the resource.
         public let path: String
 
-        public init(rule: Rule, path: String) {
+        /// The explicit localization of the resource.
+        public let localization: Localization?
+
+        public init(rule: Rule, path: String, localization: Localization? = nil) {
+            precondition(rule == .process || localization == nil)
             self.rule = rule
             self.path = path
+            self.localization = localization
         }
     }
 
@@ -213,6 +457,9 @@ public struct TargetDescription: Equatable, Codable {
 
     /// The custom path of the target.
     public let path: String?
+
+    /// The url of the binary target artifact.
+    public let url: String?
 
     /// The custom sources of the target.
     public let sources: [String]?
@@ -248,10 +495,14 @@ public struct TargetDescription: Equatable, Codable {
     /// The target-specific build settings declared in this target.
     public let settings: [TargetBuildSettingDescription.Setting]
 
+    /// The binary target checksum.
+    public let checksum: String?
+
     public init(
         name: String,
         dependencies: [Dependency] = [],
         path: String? = nil,
+        url: String? = nil,
         exclude: [String] = [],
         sources: [String]? = nil,
         resources: [Resource] = [],
@@ -259,17 +510,45 @@ public struct TargetDescription: Equatable, Codable {
         type: TargetType = .regular,
         pkgConfig: String? = nil,
         providers: [SystemPackageProviderDescription]? = nil,
-        settings: [TargetBuildSettingDescription.Setting] = []
+        settings: [TargetBuildSettingDescription.Setting] = [],
+        checksum: String? = nil
     ) {
         switch type {
         case .regular, .test:
-            precondition(pkgConfig == nil && providers == nil)
-        case .system: break
+            precondition(
+                url == nil &&
+                pkgConfig == nil &&
+                providers == nil &&
+                checksum == nil
+            )
+        case .system:
+            precondition(
+                dependencies.isEmpty &&
+                exclude.isEmpty &&
+                sources == nil &&
+                resources.isEmpty &&
+                publicHeadersPath == nil &&
+                settings.isEmpty &&
+                checksum == nil
+            )
+        case .binary:
+            precondition(path != nil || url != nil)
+            precondition(
+                dependencies.isEmpty &&
+                exclude.isEmpty &&
+                sources == nil &&
+                resources.isEmpty &&
+                publicHeadersPath == nil &&
+                pkgConfig == nil &&
+                providers == nil &&
+                settings.isEmpty
+            )
         }
 
         self.name = name
         self.dependencies = dependencies
         self.path = path
+        self.url = url
         self.publicHeadersPath = publicHeadersPath
         self.sources = sources
         self.exclude = exclude
@@ -278,6 +557,7 @@ public struct TargetDescription: Equatable, Codable {
         self.pkgConfig = pkgConfig
         self.providers = providers
         self.settings = settings
+        self.checksum = checksum
     }
 }
 
@@ -309,6 +589,7 @@ public struct ProductDescription: Equatable, Codable {
 public enum SystemPackageProviderDescription: Equatable {
     case brew([String])
     case apt([String])
+    case yum([String])
 }
 
 /// Represents a package dependency.
@@ -346,6 +627,12 @@ public struct PackageDependencyDescription: Equatable, Codable {
         }
     }
 
+    /// The name of the dependency explicitly defined in the manifest.
+    public let explicitName: String?
+
+    /// The name of the dependency, either explicitly defined in the manifest, or deduced from the URL.
+    public let name: String
+
     /// The url of the dependency.
     public let url: String
 
@@ -353,37 +640,148 @@ public struct PackageDependencyDescription: Equatable, Codable {
     public let requirement: Requirement
 
     /// Create a dependency.
-    public init(url: String, requirement: Requirement) {
+    public init(name: String?, url: String, requirement: Requirement) {
+        self.explicitName = name
+        self.name = name ?? PackageReference.computeDefaultName(fromURL: url)
         self.url = url
         self.requirement = requirement
     }
 }
 
+/// The products requested of a package.
+///
+/// Any product which matches the filter will be used for dependency resolution, whereas unrequested products will be ingored.
+///
+/// Requested products need not actually exist in the package. Under certain circumstances, the resolver may request names whose package of origin are unknown. The intended package will recognize and fullfill the request; packages that do not know what it is will simply ignore it.
+public enum ProductFilter: Equatable, Hashable, Codable, JSONMappable, JSONSerializable, CustomStringConvertible {
+
+    /// All products, targets, and tests are requested.
+    ///
+    /// This is used for root packages.
+    case everything
+
+    /// A set of specific products requested by one or more client packages.
+    case specific(Set<String>)
+
+    public func union(_ other: ProductFilter) -> ProductFilter {
+        switch self {
+        case .everything:
+            return .everything
+        case .specific(let set):
+            switch other {
+            case .everything:
+                return .everything
+            case .specific(let otherSet):
+                return .specific(set.union(otherSet))
+            }
+        }
+    }
+    public mutating func formUnion(_ other: ProductFilter) {
+        self = self.union(other)
+    }
+
+    public func contains(_ product: String) -> Bool {
+        switch self {
+        case .everything:
+            return true
+        case .specific(let set):
+            return set.contains(product)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        let optionalSet: Set<String>?
+        switch self {
+        case .everything:
+            optionalSet = nil
+        case .specific(let set):
+            optionalSet = set
+        }
+        var container = encoder.singleValueContainer()
+        try container.encode(optionalSet?.sorted())
+    }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let optionalSet: Set<String>? = try container.decode([String]?.self).map { Set($0) }
+        if let set = optionalSet {
+            self = .specific(set)
+        } else {
+            self = .everything
+        }
+    }
+
+    public func toJSON() -> JSON {
+        switch self {
+        case .everything:
+            return "all".toJSON()
+        case .specific(let products):
+            return products.sorted().toJSON()
+        }
+    }
+    public init(json: JSON) throws {
+        if let products = try? [String](json: json) {
+            self = .specific(Set(products))
+        } else {
+            self = .everything
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .everything:
+            return "[everything]"
+        case .specific(let set):
+            return "[\(set.sorted().joined(separator: ", "))]"
+        }
+    }
+}
+
+/// A dependency description along with its associated product filter.
+public struct FilteredDependencyDescription: Codable {
+
+    /// Creates a filtered dependency.
+    ///
+    /// - Parameters:
+    ///   - declaration: The raw dependency.
+    ///   - productFilter: The product filter to apply.
+    public init(declaration: PackageDependencyDescription, productFilter: ProductFilter) {
+        self.declaration = declaration
+        self.productFilter = productFilter
+    }
+
+    /// The loaded dependency declaration.
+    public let declaration: PackageDependencyDescription
+
+    /// The resolved product filter.
+    public let productFilter: ProductFilter
+}
+
 public struct PlatformDescription: Codable, Equatable {
     public let platformName: String
     public let version: String
+    public let options: [String]
 
-    public init(name: String, version: String) {
+    public init(name: String, version: String, options: [String] = []) {
         self.platformName = name
         self.version = version
+        self.options = options
+    }
+}
+
+/// Represents a manifest condition.
+public struct PackageConditionDescription: Codable, Equatable {
+    public let platformNames: [String]
+    public let config: String?
+
+    public init(platformNames: [String] = [], config: String? = nil) {
+        assert(!(platformNames.isEmpty && config == nil))
+        self.platformNames = platformNames
+        self.config = config
     }
 }
 
 /// A namespace for target-specific build settings.
 public enum TargetBuildSettingDescription {
-
-    /// Represents a build settings condition.
-    public struct Condition: Codable, Equatable {
-
-        public let platformNames: [String]
-        public let config: String?
-
-        public init(platformNames: [String] = [], config: String? = nil) {
-            assert(!(platformNames.isEmpty && config == nil))
-            self.platformNames = platformNames
-            self.config = config
-        }
-    }
 
     /// The tool for which a build setting is declared.
     public enum Tool: String, Codable, Equatable, CaseIterable {
@@ -413,7 +811,7 @@ public enum TargetBuildSettingDescription {
         public let name: SettingName
 
         /// The condition at which the setting should be applied.
-        public let condition: Condition?
+        public let condition: PackageConditionDescription?
 
         /// The value of the setting.
         ///
@@ -425,7 +823,7 @@ public enum TargetBuildSettingDescription {
             tool: Tool,
             name: SettingName,
             value: [String],
-            condition: Condition? = nil
+            condition: PackageConditionDescription? = nil
         ) {
             switch name {
             case .headerSearchPath: fallthrough
@@ -444,5 +842,62 @@ public enum TargetBuildSettingDescription {
             self.value = value
             self.condition = condition
         }
+    }
+}
+
+/// The configuration of the build environment.
+public enum BuildConfiguration: String, CaseIterable, Codable {
+    case debug
+    case release
+
+    public var dirname: String {
+        switch self {
+            case .debug: return "debug"
+            case .release: return "release"
+        }
+    }
+}
+
+/// A build environment with which to evaluation conditions.
+public struct BuildEnvironment: Codable {
+    public let platform: Platform
+    public let configuration: BuildConfiguration
+
+    public init(platform: Platform, configuration: BuildConfiguration) {
+        self.platform = platform
+        self.configuration = configuration
+    }
+}
+
+/// A manifest condition.
+public protocol PackageConditionProtocol: Codable {
+    func satisfies(_ environment: BuildEnvironment) -> Bool
+}
+
+/// Platforms condition implies that an assignment is valid on these platforms.
+public struct PlatformsCondition: PackageConditionProtocol {
+    public let platforms: [Platform]
+
+    public init(platforms: [Platform]) {
+        assert(!platforms.isEmpty, "List of platforms should not be empty")
+        self.platforms = platforms
+    }
+
+    public func satisfies(_ environment: BuildEnvironment) -> Bool {
+        platforms.contains(environment.platform)
+    }
+}
+
+/// A configuration condition implies that an assignment is valid on
+/// a particular build configuration.
+public struct ConfigurationCondition: PackageConditionProtocol {
+    public let configuration: BuildConfiguration
+
+    public init(configuration: BuildConfiguration) {
+        self.configuration = configuration
+    }
+
+    public func satisfies(_ environment: BuildEnvironment) -> Bool {
+        configuration == environment.configuration
     }
 }

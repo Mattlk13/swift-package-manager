@@ -14,8 +14,32 @@ import PackageModel
 /// Create an initial template package.
 public final class InitPackage {
     /// The tool version to be used for new packages.
-    public static let newPackageToolsVersion = ToolsVersion(version: "5.1.0")
-    
+    public static let newPackageToolsVersion = ToolsVersion(version: "5.3.0")
+
+    /// Options for the template package.
+    public struct InitPackageOptions {
+        /// The type of package to create.
+        public var packageType: PackageType
+
+        /// Whether to laydown files related to corelibs-xctest manifest.
+        public var enableXCTestManifest: Bool
+
+        /// The list of platforms in the manifest.
+        ///
+        /// Note: This should only contain Apple platforms right now.
+        public var platforms: [SupportedPlatform]
+
+        public init(
+            packageType: PackageType,
+            enableXCTestManifest: Bool = true,
+            platforms: [SupportedPlatform] = []
+        ) {
+            self.packageType = packageType
+            self.enableXCTestManifest = enableXCTestManifest
+            self.platforms = platforms
+        }
+    }
+
     /// Represents a package type for the purposes of initialization.
     public enum PackageType: String, CustomStringConvertible {
         case empty = "empty"
@@ -36,7 +60,10 @@ public final class InitPackage {
     let destinationPath: AbsolutePath
 
     /// The type of package to create.
-    let packageType: PackageType
+    var packageType: PackageType { options.packageType }
+
+    /// The options for package to create.
+    let options: InitPackageOptions
 
     /// The name of the package to create.
     let pkgname: String
@@ -50,8 +77,25 @@ public final class InitPackage {
     }
 
     /// Create an instance that can create a package with given arguments.
-    public init(name: String, destinationPath: AbsolutePath, packageType: PackageType) throws {
-        self.packageType = packageType
+    public convenience init(
+        name: String,
+        destinationPath: AbsolutePath,
+        packageType: PackageType
+    ) throws {
+        try self.init(
+            name: name,
+            destinationPath: destinationPath,
+            options: InitPackageOptions(packageType: packageType)
+        )
+    }
+
+    /// Create an instance that can create a package with given arguments.
+    public init(
+        name: String,
+        destinationPath: AbsolutePath,
+        options: InitPackageOptions
+    ) throws {
+        self.options = options
         self.destinationPath = destinationPath
         self.pkgname = name
         self.moduleName = name.spm_mangledToC99ExtendedIdentifier()
@@ -102,10 +146,35 @@ public final class InitPackage {
                     name: "\(pkgname)"
                 """)
 
+            var platformsParams = [String]()
+            for supportedPlatform in options.platforms {
+                let version = supportedPlatform.version
+                let platform = supportedPlatform.platform
+
+                var param = ".\(platform.manifestName)("
+                if supportedPlatform.isManifestAPIAvailable {
+                    if version.minor > 0 {
+                        param += ".v\(version.major)_\(version.minor)"
+                    } else {
+                        param += ".v\(version.major)"
+                    }
+                } else {
+                    param += "\"\(version.versionString)\""
+                }
+                param += ")"
+
+                platformsParams.append(param)
+            }
+            if !options.platforms.isEmpty {
+                pkgParams.append("""
+                        platforms: [\(platformsParams.joined(separator: ", "))]
+                    """)
+            }
+
             if packageType == .library || packageType == .manifest {
                 pkgParams.append("""
                     products: [
-                        // Products define the executables and libraries produced by a package, and make them visible to other packages.
+                        // Products define the executables and libraries a package produces, and make them visible to other packages.
                         .library(
                             name: "\(pkgname)",
                             targets: ["\(pkgname)"]),
@@ -124,7 +193,7 @@ public final class InitPackage {
                 pkgParams.append("""
                     targets: [
                         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
-                        // Targets can depend on other targets in this package, and on products in packages which this package depends on.
+                        // Targets can depend on other targets in this package, and on products in packages this package depends on.
                         .target(
                             name: "\(pkgname)",
                             dependencies: []),
@@ -177,6 +246,8 @@ public final class InitPackage {
                 /Packages
                 /*.xcodeproj
                 xcuserdata/
+                DerivedData/
+                .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 
                 """
         }
@@ -264,6 +335,7 @@ public final class InitPackage {
     }
 
     private func writeLinuxMain(testsPath: AbsolutePath) throws {
+        guard options.enableXCTestManifest else { return }
         try writePackageFile(testsPath.appending(component: "LinuxMain.swift")) { stream in
             stream <<< """
                 import XCTest
@@ -292,12 +364,22 @@ public final class InitPackage {
                         XCTAssertEqual(\(typeName)().text, "Hello, World!")
                     }
 
-                    static var allTests = [
-                        ("testExample", testExample),
-                    ]
-                }
+            """
+
+            if options.enableXCTestManifest {
+                stream <<< """
+
+                        static var allTests = [
+                            ("testExample", testExample),
+                        ]
 
                 """
+            }
+
+            stream <<< """
+                }
+
+            """
         }
     }
 
@@ -318,6 +400,9 @@ public final class InitPackage {
                             return
                         }
 
+                        // Mac Catalyst won't have `Process`, but it is supported for executables.
+                        #if !targetEnvironment(macCatalyst)
+
                         let fooBinary = productsDirectory.appendingPathComponent("\(pkgname)")
 
                         let process = Process()
@@ -333,6 +418,7 @@ public final class InitPackage {
                         let output = String(data: data, encoding: .utf8)
 
                         XCTAssertEqual(output, "Hello, world!\\n")
+                        #endif
                     }
 
                     /// Returns path to the built products directory.
@@ -347,9 +433,19 @@ public final class InitPackage {
                       #endif
                     }
 
+                """
+
+            if options.enableXCTestManifest {
+                stream <<< """
+
                     static var allTests = [
                         ("testExample", testExample),
                     ]
+
+                """
+            }
+
+            stream <<< """
                 }
 
                 """
@@ -370,6 +466,11 @@ public final class InitPackage {
             try writeExecutableTestsFile(testClassFile)
         }
 
+        try writeXCTestManifest(testModule)
+    }
+
+    func writeXCTestManifest(_ testModule: AbsolutePath) throws {
+        guard options.enableXCTestManifest else { return }
         try writePackageFile(testModule.appending(component: "XCTestManifests.swift")) { stream in
             stream <<< """
                 import XCTest
@@ -385,7 +486,6 @@ public final class InitPackage {
                 """
         }
     }
-
 }
 
 // Private helpers
@@ -399,6 +499,55 @@ extension InitError: CustomStringConvertible {
         switch self {
         case .manifestAlreadyExists:
             return "a manifest file already exists in this directory"
+        }
+    }
+}
+
+extension PackageModel.Platform {
+    var manifestName: String {
+        switch self {
+        case .macOS:
+            return "macOS"
+        case .iOS:
+            return "iOS"
+        case .tvOS:
+            return "tvOS"
+        case .watchOS:
+            return "watchOS"
+        default:
+            fatalError("unexpected manifest name call for platform \(self)")
+        }
+    }
+}
+
+extension SupportedPlatform {
+    var isManifestAPIAvailable: Bool {
+        if platform == .macOS && self.version.major == 10 {
+            guard self.version.patch == 0 else {
+                return false
+            }
+        } else if [Platform.macOS, .iOS, .watchOS, .tvOS].contains(platform) {
+            guard self.version.minor == 0, self.version.patch == 0 else {
+                return false
+            }
+        } else {
+            return false
+        }
+
+        switch platform {
+        case .macOS where version.major == 10:
+            return (10...15).contains(version.minor)
+        case .macOS:
+            return (11...11).contains(version.major)
+        case .iOS:
+            return (8...14).contains(version.major)
+        case .tvOS:
+            return (9...14).contains(version.major)
+        case .watchOS:
+            return (2...7).contains(version.major)
+
+        default:
+            return false
         }
     }
 }

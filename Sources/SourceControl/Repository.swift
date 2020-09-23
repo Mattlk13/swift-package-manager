@@ -26,7 +26,7 @@ public struct RepositorySpecifier: Hashable {
     /// unique for each repository.
     public var fileSystemIdentifier: String {
         // Use first 8 chars of a stable hash.
-        let hash = SHA256(url).digestString()
+        let hash = SHA256().hash(url).hexadecimalRepresentation
         let suffix = hash.dropLast(hash.count - 8)
 
         return basename + "-" + suffix
@@ -83,7 +83,10 @@ public protocol RepositoryProvider {
 
     /// Clone a managed repository into a working copy at on the local file system.
     ///
-    /// Once complete, the repository can be opened using `openCheckout`.
+    /// Once complete, the repository can be opened using `openCheckout`. Note
+    /// that there is no requirement that the files have been materialized into
+    /// the file system at the completion of this call, since it will always be
+    /// followed by checking out the cloned working copy at a particular ref.
     ///
     /// - Parameters:
     ///   - sourcePath: The location of the repository on disk, at which the

@@ -523,7 +523,7 @@ public static func target(
 /// - Parameters:
 ///   - name: The name of the target.
 ///   - dependencies: The dependencies of the target. These can either be other targets in the package or products from other packages.
-///   - path: The custom path for the target. By default, targets will be looked up in the <package-root>/Sources/<target-name> directory.
+///   - path: The custom path for the target. By default, targets will be looked up in the <package-root>/Tests/<target-name> directory.
 ///       Do not escape the package root, i.e. values like "../Foo" or "/Foo" are invalid.
 ///   - exclude: A list of paths to exclude from being considered source files. This path is relative to the target's directory.
 ///   - sources: An explicit list of source files.
@@ -578,7 +578,7 @@ Represents dependency on other targets in the package or products from other pac
 public static func target(name: String) -> Target.Dependency
 
 /// A dependency on a product from a package dependency.
-public static func product(name: String, package: String? = nil) -> Target.Dependency
+public static func product(name: String, package: String) -> Target.Dependency
 
 // A by-name dependency that resolves to either a target or a product,
 // as above, after the package graph has been loaded.

@@ -10,7 +10,7 @@
 
 import TSCBasic
 import SPMTestSupport
-@testable import Xcodeproj
+import Xcodeproj
 import XCTest
 
 class XcodeProjectModelSerializationTests: XCTestCase {
@@ -140,6 +140,33 @@ class XcodeProjectModelSerializationTests: XCTestCase {
             return flag
         }
         XCTAssertEqual(activeCompilationConditions, activeCompilationConditionsValues)
+    }
+
+    func testSpaceSeparatedBuildSettingsSerialization() {
+        var buildSettings = Xcode.BuildSettingsTable.BuildSettings()
+        buildSettings.HEADER_SEARCH_PATHS = ["value", "value with spaces", "\"value with spaces\"", #"value\ with\ spaces"#]
+
+        let plist = buildSettings.asPropertyList()
+
+        guard case let .dictionary(buildSettingsDict) = plist else {
+            XCTFail("build settings plist must be a dictionary")
+            return
+        }
+
+        guard case let .array(headerSearchPathsArray) = buildSettingsDict["HEADER_SEARCH_PATHS"] else {
+            XCTFail("header search paths plist must be an array")
+            return
+        }
+
+        let headerSearchPaths = headerSearchPathsArray.compactMap { pathPlist -> String? in
+            guard case let .string(path) = pathPlist else {
+                XCTFail("headerSearchPaths plist must be a string")
+                return nil
+            }
+            return path
+        }
+
+        XCTAssertEqual(headerSearchPaths, ["value", "\"value with spaces\"", "\"value with spaces\"", #"value\ with\ spaces"#])
     }
 
     func testBuildFileSettingsSerialization() {
